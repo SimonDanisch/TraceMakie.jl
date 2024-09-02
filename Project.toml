@@ -1,0 +1,13 @@
+name = "TraceMakie"
+uuid = "70852e3a-d594-4041-8350-783a02753e02"
+authors = ["Simon Danisch"]
+version = "1.0.0-DEV"
+
+[compat]
+julia = "1.6.7"
+
+[extras]
+Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
+
+[targets]
+test = ["Test"]
