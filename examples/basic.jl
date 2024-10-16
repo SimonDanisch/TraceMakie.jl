@@ -1,4 +1,7 @@
-using TraceMakie, FileIO, ImageShow, AMDGPU, GLMakie, BenchmarkTools
+# pkg"add https://github.com/SimonDanisch/TraceMakie.jl https://github.com/pxl-th/Trace.jl#sd/tmp"
+
+using TraceMakie, FileIO, ImageShow, GLMakie, BenchmarkTools
+using Trace
 
 begin
     catmesh = load(Makie.assetpath("cat.obj"))
@@ -8,7 +11,7 @@ begin
     cam3d!(scene)
     mesh!(scene, catmesh, color=load(Makie.assetpath("diffusemap.png")))
     center!(scene)
-    @btime TraceMakie.render_whitted(scene; samples_per_pixel=1)
+    TraceMakie.render_whitted(scene; samples_per_pixel=1)
     # 1.024328 seconds (16.94 M allocations: 5.108 GiB, 46.19% gc time, 81 lock conflicts)
     # 0.913530 seconds (16.93 M allocations: 5.108 GiB, 42.52% gc time, 57 lock conflicts)
     # 0.416158 seconds (75.58 k allocations: 88.646 MiB, 2.44% gc time, 16 lock conflicts)
@@ -32,7 +35,7 @@ begin
     surface!(scene, xs, ys, zs)
     center!(scene)
 
-    @btime TraceMakie.render_whitted(scene)
+    TraceMakie.render_whitted(scene)
     # @time TraceMakie.render_gpu(scene, ROCArray)
     # 1.598740s
     # 1.179450 seconds (17.30 M allocations: 5.126 GiB, 36.48% gc time, 94 lock conflicts)
@@ -46,7 +49,6 @@ begin
     # render_interactive(scene, ArrayType; max_depth=5)
     # TraceMakie.render_interactive(scene; backend=GLMakie, max_depth=5)
 end
-using Trace
 begin
     model = load(joinpath(dirname(pathof(Trace)), "..", "docs", "src", "assets", "models", "caustic-glass.ply"))
     glass = Trace.GlassMaterial(
