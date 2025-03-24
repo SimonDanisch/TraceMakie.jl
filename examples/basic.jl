@@ -1,7 +1,8 @@
 # pkg"add https://github.com/SimonDanisch/TraceMakie.jl https://github.com/pxl-th/Trace.jl#sd/tmp"
 
 using TraceMakie, FileIO, ImageShow, GLMakie, BenchmarkTools
-using Trace
+using Trace, AMDGPU
+using Chairmarks
 
 begin
     catmesh = load(Makie.assetpath("cat.obj"))
@@ -11,7 +12,8 @@ begin
     cam3d!(scene)
     mesh!(scene, catmesh, color=load(Makie.assetpath("diffusemap.png")))
     center!(scene)
-    TraceMakie.render_whitted(scene; samples_per_pixel=1)
+    @b TraceMakie.render_whitted(scene; samples_per_pixel=1)
+    @b TraceMakie.render_gpu(scene, ROCArray; samples_per_pixel=1)
     # 1.024328 seconds (16.94 M allocations: 5.108 GiB, 46.19% gc time, 81 lock conflicts)
     # 0.913530 seconds (16.93 M allocations: 5.108 GiB, 42.52% gc time, 57 lock conflicts)
     # 0.416158 seconds (75.58 k allocations: 88.646 MiB, 2.44% gc time, 16 lock conflicts)
@@ -24,6 +26,8 @@ begin
     # TraceMakie.render_interactive(scene; backend=GLMakie, max_depth=5)
 end
 
+using ImageShow, AMDGPU
+
 begin
     scene = Scene(size=(1024, 1024);
         lights=[AmbientLight(RGBf(0.4, 0.4, 0.4)), PointLight(Vec3f(4, 4, 10), RGBf(500, 500, 500))]
@@ -35,7 +39,8 @@ begin
     surface!(scene, xs, ys, zs)
     center!(scene)
 
-    TraceMakie.render_whitted(scene)
+    @b TraceMakie.render_whitted(scene)
+    @b TraceMakie.render_gpu(scene, ROCArray)
     # @time TraceMakie.render_gpu(scene, ROCArray)
     # 1.598740s
     # 1.179450 seconds (17.30 M allocations: 5.126 GiB, 36.48% gc time, 94 lock conflicts)
@@ -103,4 +108,12 @@ begin
 
     # render_interactive(scene, ArrayType; max_depth=5)
     TraceMakie.render_interactive(scene; backend=GLMakie, max_depth=5)
+    TraceMakie.render_gpu(scene, ROCArray)
 end
+
+using GeometryBasics
+mesh = load(Makie.assetpath("cat.obj"))
+fs = decompose(TriangleFace{UInt32}, mesh)
+vertices = decompose(Point3f, mesh)
+normals = Normal3f.(decompose_normals(mesh))
+uvs = Point2f.(GeometryBasics.decompose_uv(mesh))

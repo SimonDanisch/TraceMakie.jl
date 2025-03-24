@@ -11,11 +11,6 @@ Makie = "ee78f7c6-11fb-53f2-987a-cfe4a2b5a57a"
 Trace = "afc56b53-c9a9-482a-a956-d1d800e05558"
 
 [compat]
-Colors = "0.12.11"
-GeometryBasics = "0.4.11"
-LinearAlgebra = "1"
-Makie = "0.21"
-julia = "1.6.7"
 
 [extras]
 Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"

@@ -83,7 +83,7 @@ function to_trace_primitive(plot::Makie.Surface)
     faces = decompose(GLTriangleFace, r)
     uv = decompose_uv(r)
     # with this we can beuild a mesh
-    mesh = normal_mesh(GeometryBasics.Mesh(meta(vec(positions[]), uv=uv), faces))
+    mesh = normal_mesh(GeometryBasics.Mesh(vec(positions[]), faces, uv=uv))
 
     triangles = Trace.create_triangle_mesh(mesh)
     material = extract_material(plot, plot.z)
@@ -175,7 +175,7 @@ function render_gpu(mscene::Makie.Scene, ArrayType; samples_per_pixel=8, max_dep
     gpu_scene = Trace.to_gpu(ArrayType, scene; preserve=preserve)
     gpu_film = Trace.to_gpu(ArrayType, film; preserve=preserve)
     GC.@preserve preserve begin
-        integrator(gpu_scene, gpu_film)
+        integrator(gpu_scene, gpu_film, camera[])
     end
     return Array(film.framebuffer)
 end
