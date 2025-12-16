@@ -1,19 +1,20 @@
-# pkg"add https://github.com/SimonDanisch/TraceMakie.jl https://github.com/pxl-th/Trace.jl#sd/tmp"
+# pkg"add https://github.com/SimonDanisch/TraceMakie.jl https://github.com/pxl-th/Hikari.jl#sd/tmp"
 
 using TraceMakie, FileIO, ImageShow, GLMakie, BenchmarkTools
-using Trace, AMDGPU
+using Hikari, AMDGPU
 using Chairmarks
 
 begin
     catmesh = load(Makie.assetpath("cat.obj"))
     scene = Scene(size=(1024, 1024);
-        lights=[AmbientLight(RGBf(0.7, 0.6, 0.6)), PointLight(Vec3f(0, 1, 0.5), RGBf(1.3, 1.3, 1.3))]
+        lights=[AmbientLight(RGBf(0.7, 0.6, 0.6)), PointLight(RGBf(1.3, 1.3, 1.3), Vec3f(0, 1, 0.5))]
     )
     cam3d!(scene)
     mesh!(scene, catmesh, color=load(Makie.assetpath("diffusemap.png")))
     center!(scene)
-    @b TraceMakie.render_whitted(scene; samples_per_pixel=1)
-    @b TraceMakie.render_gpu(scene, ROCArray; samples_per_pixel=1)
+    @b TraceMakie.render_whitted(scene; samples_per_pixel=8)
+    display(scene; backend=RPRMakie)
+    # @b TraceMakie.render_gpu(scene, ROCArray; samples_per_pixel=1)
     # 1.024328 seconds (16.94 M allocations: 5.108 GiB, 46.19% gc time, 81 lock conflicts)
     # 0.913530 seconds (16.93 M allocations: 5.108 GiB, 42.52% gc time, 57 lock conflicts)
     # 0.416158 seconds (75.58 k allocations: 88.646 MiB, 2.44% gc time, 16 lock conflicts)
@@ -30,7 +31,7 @@ using ImageShow, AMDGPU
 
 begin
     scene = Scene(size=(1024, 1024);
-        lights=[AmbientLight(RGBf(0.4, 0.4, 0.4)), PointLight(Vec3f(4, 4, 10), RGBf(500, 500, 500))]
+        lights=[AmbientLight(RGBf(0.4, 0.4, 0.4)), PointLight(RGBf(500, 500, 500), Vec3f(4, 4, 10))]
     )
     cam3d!(scene)
     xs = LinRange(0, 10, 100)
@@ -55,32 +56,32 @@ begin
     # TraceMakie.render_interactive(scene; backend=GLMakie, max_depth=5)
 end
 begin
-    model = load(joinpath(dirname(pathof(Trace)), "..", "docs", "src", "assets", "models", "caustic-glass.ply"))
-    glass = Trace.GlassMaterial(
-        Trace.ConstantTexture(Trace.RGBSpectrum(0.9f0)),
-        Trace.ConstantTexture(Trace.RGBSpectrum(0.88f0)),
-        Trace.ConstantTexture(0.0f0),
-        Trace.ConstantTexture(0.0f0),
-        Trace.ConstantTexture(1.4f0),
+    model = load(joinpath(dirname(pathof(Hikari)), "..", "docs", "src", "assets", "models", "caustic-glass.ply"))
+    glass = Hikari.GlassMaterial(
+        Hikari.ConstantTexture(Hikari.RGBSpectrum(0.9f0)),
+        Hikari.ConstantTexture(Hikari.RGBSpectrum(0.88f0)),
+        Hikari.ConstantTexture(0.0f0),
+        Hikari.ConstantTexture(0.0f0),
+        Hikari.ConstantTexture(1.4f0),
         true,
     )
-    plastic = Trace.PlasticMaterial(
-        Trace.ConstantTexture(Trace.RGBSpectrum(0.6399999857f0, 0.6399999857f0, 0.5399999857f0)),
-        Trace.ConstantTexture(Trace.RGBSpectrum(0.1000000015f0, 0.1000000015f0, 0.1000000015f0)),
-        Trace.ConstantTexture(0.010408001f0),
+    plastic = Hikari.PlasticMaterial(
+        Hikari.ConstantTexture(Hikari.RGBSpectrum(0.6399999857f0, 0.6399999857f0, 0.5399999857f0)),
+        Hikari.ConstantTexture(Hikari.RGBSpectrum(0.1000000015f0, 0.1000000015f0, 0.1000000015f0)),
+        Hikari.ConstantTexture(0.010408001f0),
         true,
     )
-    plastic_ceil = Trace.PlasticMaterial(
-        Trace.ConstantTexture(Trace.RGBSpectrum(0.3399999857f0, 0.6399999857f0, 0.8399999857f0)),
-        Trace.ConstantTexture(Trace.RGBSpectrum(1.4f0)),
-        Trace.ConstantTexture(0.000408001f0),
+    plastic_ceil = Hikari.PlasticMaterial(
+        Hikari.ConstantTexture(Hikari.RGBSpectrum(0.3399999857f0, 0.6399999857f0, 0.8399999857f0)),
+        Hikari.ConstantTexture(Hikari.RGBSpectrum(1.4f0)),
+        Hikari.ConstantTexture(0.000408001f0),
         true,
     )
     scene = Scene(size=(1024, 1024); lights=[
         AmbientLight(RGBf(1, 1, 1)),
-        PointLight(Vec3f(4, 4, 10), RGBf(150, 150, 150)),
-        PointLight(Vec3f(-3, 10, 2.5), RGBf(60, 60, 60)),
-        PointLight(Vec3f(0, 3, 0.5), RGBf(40, 40, 40))
+        PointLight(RGBf(150, 150, 150), Vec3f(4, 4, 10)),
+        PointLight(RGBf(60, 60, 60), Vec3f(-3, 10, 2.5)),
+        PointLight(RGBf(40, 40, 40), Vec3f(0, 3, 0.5))
     ])
     cam3d!(scene)
     cm = scene.camera_controls
@@ -107,8 +108,9 @@ begin
     # 1.686 s (1707363 allocations: 233.62 MiB)
 
     # render_interactive(scene, ArrayType; max_depth=5)
-    TraceMakie.render_interactive(scene; backend=GLMakie, max_depth=5)
-    TraceMakie.render_gpu(scene, ROCArray)
+    TraceMakie.render_whitted(scene; samples_per_pixel=8)
+    # TraceMakie.render_interactive(scene; backend=GLMakie, max_depth=5)
+    # TraceMakie.render_gpu(scene, ROCArray)
 end
 
 using GeometryBasics
