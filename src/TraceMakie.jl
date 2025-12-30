@@ -4,12 +4,16 @@ using Makie, Hikari, Colors, LinearAlgebra, GeometryBasics, Raycore
 
 function to_spectrum(data::Colorant)
     rgb = RGBf(data)
-    return Hikari.RGBSpectrum(rgb.r, rgb.g, rgb.b)
+    alpha = data isa TransparentColor ? Float32(Colors.alpha(data)) : 1f0
+    return Hikari.RGBSpectrum(rgb.r, rgb.g, rgb.b, alpha)
 end
 
 function to_spectrum(data::AbstractMatrix{<:Colorant})
-    colors = convert(AbstractMatrix{RGBf}, data)
-    return collect(reinterpret(Hikari.RGBSpectrum, colors))
+    return map(data) do c
+        rgb = RGBf(c)
+        alpha = c isa TransparentColor ? Float32(Colors.alpha(c)) : 1f0
+        Hikari.RGBSpectrum(rgb.r, rgb.g, rgb.b, alpha)
+    end
 end
 
 function extract_material(plot::Plot, tex::Union{Hikari.Texture, Nothing})
@@ -52,10 +56,82 @@ function extract_material(plot::Plot, color_obs::Union{Makie.Computed, Observabl
     return extract_material(plot, tex)
 end
 
+"""
+Convert a Makie material dict (from GLB) to a Hikari material.
+"""
+function glb_material_to_hikari(mat_dict::Dict{String, Any})
+    # Check for diffuse map (texture)
+    if haskey(mat_dict, "diffuse map")
+        diffuse_map = mat_dict["diffuse map"]
+        if haskey(diffuse_map, "image")
+            img = diffuse_map["image"]
+            tex = Hikari.Texture(to_spectrum(img))
+            roughness = get(mat_dict, "roughness", 0.5f0)
+            return Hikari.MatteMaterial(tex, Hikari.ConstantTexture(Float32(roughness) * 90f0))
+        end
+    end
+
+    # Check for diffuse color
+    if haskey(mat_dict, "diffuse")
+        diffuse = mat_dict["diffuse"]
+        color = RGBf(diffuse[1], diffuse[2], diffuse[3])
+        tex = Hikari.ConstantTexture(to_spectrum(color))
+        roughness = get(mat_dict, "roughness", 0.5f0)
+        return Hikari.MatteMaterial(tex, Hikari.ConstantTexture(Float32(roughness) * 90f0))
+    end
+
+    # Default: white matte
+    return Hikari.MatteMaterial(
+        Hikari.ConstantTexture(Hikari.RGBSpectrum(0.8f0, 0.8f0, 0.8f0)),
+        Hikari.ConstantTexture(0.0f0)
+    )
+end
+
 function to_trace_primitive(plot::Makie.Mesh)
-    # Potentially per instance attributes
     mesh = plot.mesh[]
-    # Convert to TriangleMesh using Raycore
+
+    # Handle MetaMesh with materials
+    if mesh isa GeometryBasics.MetaMesh
+        primitives = Tuple[]
+
+        # Check if we have material info
+        if haskey(mesh, :material_names) && haskey(mesh, :materials)
+            submeshes = GeometryBasics.split_mesh(mesh.mesh)
+            material_names = mesh[:material_names]
+            materials_dict = mesh[:materials]
+
+            # Cache converted materials to avoid creating duplicate textures
+            hikari_materials = Dict{String, Any}()
+            default_mat = nothing
+
+            for (name, submesh) in zip(material_names, submeshes)
+                tmesh = Raycore.TriangleMesh(submesh)
+
+                # Get or create cached material
+                mat = get!(hikari_materials, name) do
+                    if haskey(materials_dict, name)
+                        glb_material_to_hikari(materials_dict[name])
+                    else
+                        if isnothing(default_mat)
+                            default_mat = extract_material(plot, plot.color)
+                        end
+                        default_mat
+                    end
+                end
+
+                push!(primitives, (tmesh, mat))
+            end
+        else
+            # MetaMesh without material info - treat as single mesh
+            tmesh = Raycore.TriangleMesh(mesh.mesh)
+            mat = extract_material(plot, plot.color)
+            push!(primitives, (tmesh, mat))
+        end
+
+        return primitives
+    end
+
+    # Regular mesh
     tmesh = Raycore.TriangleMesh(mesh)
     material = extract_material(plot, plot.color)
     return (tmesh, material)
@@ -142,7 +218,14 @@ function convert_scene(scene::Makie.Scene)
     primitives = Tuple[]
     for plot in scene.plots
         prim = to_trace_primitive(plot)
-        !isnothing(prim) && push!(primitives, prim)
+        if !isnothing(prim)
+            if prim isa Vector
+                # Multiple primitives (e.g., from MetaMesh)
+                append!(primitives, prim)
+            else
+                push!(primitives, prim)
+            end
+        end
     end
     camera = to_trace_camera(scene, film)
 
@@ -173,7 +256,8 @@ end
 function render_whitted(mscene::Makie.Scene; samples_per_pixel=8, max_depth=5)
     scene, camera, film = convert_scene(mscene)
     integrator = Hikari.WhittedIntegrator(camera[], Hikari.UniformSampler(samples_per_pixel), max_depth)
-    Hikari.integrator_threaded(integrator, scene, film, camera[])
+    # Call integrator directly - it uses KernelAbstractions for CPU/GPU dispatch
+    integrator(scene, film, camera[])
     return film.framebuffer
 end
 
@@ -187,10 +271,12 @@ end
 function render_gpu(mscene::Makie.Scene, ArrayType; samples_per_pixel=8, max_depth=5)
     scene, camera, film = convert_scene(mscene)
     integrator = Hikari.WhittedIntegrator(camera[], Hikari.UniformSampler(samples_per_pixel), max_depth)
-    gpu_scene = Hikari.to_gpu(ArrayType, scene)
+    # to_gpu returns (gpu_scene, preserve) - preserve keeps GPU arrays alive during kernel execution
+    gpu_scene, _preserve = Hikari.to_gpu(ArrayType, scene)
     gpu_film = Hikari.to_gpu(ArrayType, film)
     integrator(gpu_scene, gpu_film, camera[])
-    return Array(film.framebuffer)
+    # Copy result from GPU film back to CPU
+    return Array(gpu_film.framebuffer)
 end
 
 
@@ -209,7 +295,7 @@ function render_interactive(mscene::Makie.Scene; backend, max_depth=5)
             Hikari.clear!(film)
             imgp.visible = false
         end
-        @time Hikari.integrator_threaded(integrator, scene, film, camera[])
+        @time integrator(scene, film, camera[])
         lock(loki) do
             imgp[3] = film.framebuffer
             imgp.visible = true

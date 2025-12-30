@@ -7,12 +7,12 @@ using Chairmarks
 begin
     catmesh = load(Makie.assetpath("cat.obj"))
     scene = Scene(size=(1024, 1024);
-        lights=[AmbientLight(RGBf(0.7, 0.6, 0.6)), PointLight(RGBf(1.3, 1.3, 1.3), Vec3f(0, 1, 0.5))]
+        lights=[Makie.AmbientLight(RGBf(0.7, 0.6, 0.6)), Makie.PointLight(RGBf(1.3, 1.3, 1.3), Vec3f(0, 1, 0.5))]
     )
     cam3d!(scene)
     mesh!(scene, catmesh, color=load(Makie.assetpath("diffusemap.png")))
     center!(scene)
-    @b TraceMakie.render_whitted(scene; samples_per_pixel=8)
+    @btime TraceMakie.render_whitted(scene; samples_per_pixel=8)
     display(scene; backend=RPRMakie)
     # @b TraceMakie.render_gpu(scene, ROCArray; samples_per_pixel=1)
     # 1.024328 seconds (16.94 M allocations: 5.108 GiB, 46.19% gc time, 81 lock conflicts)
@@ -31,7 +31,7 @@ using ImageShow, AMDGPU
 
 begin
     scene = Scene(size=(1024, 1024);
-        lights=[AmbientLight(RGBf(0.4, 0.4, 0.4)), PointLight(RGBf(500, 500, 500), Vec3f(4, 4, 10))]
+        lights=[Makie.AmbientLight(RGBf(0.4, 0.4, 0.4)), Makie.PointLight(RGBf(500, 500, 500), Vec3f(4, 4, 10))]
     )
     cam3d!(scene)
     xs = LinRange(0, 10, 100)
@@ -40,8 +40,8 @@ begin
     surface!(scene, xs, ys, zs)
     center!(scene)
 
-    @b TraceMakie.render_whitted(scene)
-    @b TraceMakie.render_gpu(scene, ROCArray)
+    @btime TraceMakie.render_whitted(scene)
+    # @b TraceMakie.render_gpu(scene, ROCArray)
     # @time TraceMakie.render_gpu(scene, ROCArray)
     # 1.598740s
     # 1.179450 seconds (17.30 M allocations: 5.126 GiB, 36.48% gc time, 94 lock conflicts)
