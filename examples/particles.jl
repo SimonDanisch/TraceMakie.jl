@@ -282,7 +282,7 @@ function render_test_frame(;n_particles::Int=100, samples_per_pixel::Int=4, max_
     return img, scene, ps, mplot, screen
 end
 
-n_particles = 2000
+n_particles = 100
 scene, ps, mplot = create_particle_scene(n_particles)
 
 screen = TraceMakie.Screen(scene;
@@ -293,7 +293,7 @@ img
 img_bright = TraceMakie.postprocess!(screen; exposure=2)
 img_filmic = TraceMakie.postprocess!(screen; tonemap=:aces, exposure=2)
 img_low_gamma = TraceMakie.postprocess!(screen; gamma=1.8)
-record_particles("particles.mp4"; n_frames=180, samples_per_pixel=8)
+record_particles("particles.mp4"; n_frames=120, samples_per_pixel=8)
 # ==============================================================================
 # Main
 # ==============================================================================

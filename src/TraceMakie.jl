@@ -8,46 +8,25 @@ using Colors: N0f8
 import Makie.Observables
 
 # =============================================================================
-# Integrator types for ScreenConfig
+# ScreenConfig
 # =============================================================================
 
-abstract type IntegratorType end
-
+# Convenience constructors for integrators
 """
     Whitted(; samples_per_pixel=8, max_depth=5)
 
-Whitted-style ray tracing integrator. Fast but only handles direct lighting
+Create a Whitted-style ray tracing integrator. Fast but only handles direct lighting
 and perfect specular reflections/refractions.
 """
-Base.@kwdef struct Whitted <: IntegratorType
-    samples_per_pixel::Int = 8
-    max_depth::Int = 5
-end
-
-"""
-    SPPM(; search_radius=0.075f0, max_depth=5, iterations=100)
-
-Stochastic Progressive Photon Mapping integrator. Handles caustics and
-global illumination but slower.
-"""
-Base.@kwdef struct SPPM <: IntegratorType
-    search_radius::Float32 = 0.075f0
-    max_depth::Int = 5
-    iterations::Int = 100
-end
-
-# =============================================================================
-# ScreenConfig
-# =============================================================================
+Whitted(; samples_per_pixel=8, max_depth=5) = Hikari.WhittedIntegrator(Hikari.UniformSampler(samples_per_pixel), max_depth)
 
 """
     ScreenConfig
 
 Configuration for TraceMakie rendering.
 
-* `integrator`: The integrator to use for rendering. Options:
+* `integrator`: The integrator to use for rendering (default: `Whitted()`)
   - `Whitted(; samples_per_pixel=8, max_depth=5)` - Fast Whitted-style ray tracing
-  - `SPPM(; search_radius=0.075f0, max_depth=5, iterations=100)` - Photon mapping
 * `exposure`: Exposure multiplier for postprocessing (default: 1.0)
 * `tonemap`: Tonemapping method (default: :aces)
   - `:reinhard` - Simple Reinhard L/(1+L)
@@ -59,7 +38,7 @@ Configuration for TraceMakie rendering.
 * `gamma`: Gamma correction value (default: 2.2, use `nothing` to skip)
 """
 struct ScreenConfig
-    integrator::IntegratorType
+    integrator::Hikari.SamplerIntegrator
     exposure::Float32
     tonemap::Union{Symbol, Nothing}
     gamma::Union{Float32, Nothing}
@@ -89,10 +68,12 @@ mutable struct PlotInfo
     obs_funcs::Vector{Observables.ObserverFunction}
     instance_count::Int  # Number of instances (>1 for MeshScatter)
     per_instance_materials::Bool  # True if each instance has separate material (no batched transforms)
+    first_instance_idx::Int  # Starting index in TLAS.instances for per-instance materials
 end
 
-PlotInfo(plot, handle, transform_obs, obs_funcs) = PlotInfo(plot, handle, transform_obs, obs_funcs, 1, false)
-PlotInfo(plot, handle, transform_obs, obs_funcs, count) = PlotInfo(plot, handle, transform_obs, obs_funcs, count, false)
+PlotInfo(plot, handle, transform_obs, obs_funcs) = PlotInfo(plot, handle, transform_obs, obs_funcs, 1, false, 0)
+PlotInfo(plot, handle, transform_obs, obs_funcs, count) = PlotInfo(plot, handle, transform_obs, obs_funcs, count, false, 0)
+PlotInfo(plot, handle, transform_obs, obs_funcs, count, per_inst, first_idx) = PlotInfo(plot, handle, transform_obs, obs_funcs, count, per_inst, first_idx)
 
 """
     TraceMakieState
@@ -108,9 +89,7 @@ mutable struct TraceMakieState
     film::Hikari.Film
     camera::Observable
     needs_refit::Bool  # Flag to track if TLAS needs refit
-    # Cached scene and integrator to avoid recreating on each render
-    hikari_scene::Hikari.Scene
-    integrator::Hikari.SamplerIntegrator
+    hikari_scene::Hikari.Scene  # Cached scene to avoid recreating on each render
 end
 
 # =============================================================================
@@ -182,9 +161,9 @@ function render!(screen::Screen)
     # Clear film
     Hikari.clear!(state.film)
 
-    # Use cached scene and integrator
+    # Render using integrator from config
     camera = state.camera[]
-    state.integrator(state.hikari_scene, state.film, camera)
+    screen.config.integrator(state.hikari_scene, state.film, camera)
 
     return state.film.framebuffer
 end
@@ -277,7 +256,7 @@ end
 
 function Base.display(screen::Screen, scene::Scene; figure = nothing, display_kw...)
     screen.scene = scene
-    screen.state = convert_scene_with_state(scene, screen.config)
+    screen.state = convert_scene_with_state(scene)
     return screen
 end
 
@@ -285,7 +264,7 @@ function Base.insert!(screen::Screen, scene::Scene, plot::AbstractPlot)
     # For now, rebuild the entire state when plots change
     # Future: incremental updates
     if !isnothing(screen.state)
-        screen.state = convert_scene_with_state(scene, screen.config)
+        screen.state = convert_scene_with_state(scene)
     end
     return screen
 end
@@ -313,9 +292,6 @@ TraceMakie.activate!()
 
 # Use Whitted with custom settings
 TraceMakie.activate!(integrator = TraceMakie.Whitted(samples_per_pixel=16, max_depth=8))
-
-# Use SPPM for global illumination
-TraceMakie.activate!(integrator = TraceMakie.SPPM(iterations=200))
 
 # Configure postprocessing
 TraceMakie.activate!(exposure = 1.5, tonemap = :reinhard, gamma = 2.2)
@@ -363,16 +339,6 @@ function refit_if_needed!(state::TraceMakieState)
         Raycore.refit_tlas!(state.tlas)
         state.needs_refit = false
     end
-end
-
-"""
-    get_hikari_scene(state::TraceMakieState) -> Hikari.Scene
-
-Create a Hikari.Scene from the current state.
-"""
-function get_hikari_scene(state::TraceMakieState)
-    material_scene = Hikari.MaterialScene(state.tlas, state.materials)
-    return Hikari.Scene([state.lights...], material_scene)
 end
 
 # =============================================================================
@@ -698,7 +664,7 @@ function convert_scene_with_state(mscene::Makie.Scene)
     # Regular meshes create one Instance per mesh
     instances = Raycore.Instance[]
     materials_list = Hikari.Material[]
-    plot_to_instance_info = Dict{Makie.AbstractPlot, Tuple{Int, Int, Bool}}()  # plot -> (first_instance_idx, count, per_instance_materials)
+    plot_to_instance_info = Dict{Makie.AbstractPlot, Tuple{Int, Int, Bool, Int}}()  # plot -> (first_instance_idx, count, per_instance_materials, first_descriptor_idx)
 
     # Helper to get or add material and return (type_slot, index_within_type)
     # We track materials grouped by type for proper MaterialIndex
@@ -725,11 +691,16 @@ function convert_scene_with_state(mscene::Makie.Scene)
         return Hikari.MaterialIndex(slot, UInt32(length(type_to_materials[T])))
     end
 
+    # Track cumulative InstanceDescriptor count (not Instance count)
+    # because one Instance with N transforms creates N InstanceDescriptors
+    total_instance_descriptors = 0
+
     for plot in mscene.plots
         result = to_trace_primitive_with_transform(plot)
         if !isnothing(result)
             if result isa MeshScatterResult
                 first_idx = length(instances) + 1
+                first_descriptor_idx = total_instance_descriptors + 1
                 n_instances = length(result.transforms)
 
                 has_per_instance_mats = result.materials isa Vector
@@ -740,28 +711,34 @@ function convert_scene_with_state(mscene::Makie.Scene)
                         mat_index = get_material_index(mat)
                         push!(instances, Raycore.Instance(result.mesh, transform, mat_index))
                     end
+                    total_instance_descriptors += n_instances
                 else
                     # Single material for all instances (efficient instancing)
                     mat_index = get_material_index(result.materials)
                     metadata = [mat_index for _ in 1:n_instances]
                     push!(instances, Raycore.Instance(result.mesh, result.transforms, metadata))
+                    total_instance_descriptors += n_instances
                 end
 
-                plot_to_instance_info[plot] = (first_idx, n_instances, has_per_instance_mats)
+                plot_to_instance_info[plot] = (first_idx, n_instances, has_per_instance_mats, first_descriptor_idx)
             elseif result isa Vector
                 # Multiple primitives from MetaMesh - each gets its own Instance
                 first_idx = length(instances) + 1
+                first_descriptor_idx = total_instance_descriptors + 1
                 for (mesh, mat, transform) in result
                     mat_index = get_material_index(mat)
                     push!(instances, Raycore.Instance(mesh, transform, mat_index))
                 end
-                plot_to_instance_info[plot] = (first_idx, length(result), false)
+                total_instance_descriptors += length(result)
+                plot_to_instance_info[plot] = (first_idx, length(result), false, first_descriptor_idx)
             else
                 mesh, mat, transform = result
                 first_idx = length(instances) + 1
+                first_descriptor_idx = total_instance_descriptors + 1
                 mat_index = get_material_index(mat)
                 push!(instances, Raycore.Instance(mesh, transform, mat_index))
-                plot_to_instance_info[plot] = (first_idx, 1, false)
+                total_instance_descriptors += 1
+                plot_to_instance_info[plot] = (first_idx, 1, false, first_descriptor_idx)
             end
         end
     end
@@ -778,11 +755,13 @@ function convert_scene_with_state(mscene::Makie.Scene)
 
     # Create PlotInfos
     plot_infos = PlotInfo[]
-    for (plot, (first_idx, count, per_instance_mats)) in plot_to_instance_info
+    for (plot, (first_idx, count, per_instance_mats, first_descriptor_idx)) in plot_to_instance_info
         handle = handles[first_idx]
         transform_obs = Makie.transformationmatrix(plot)
         obs_funcs = Observables.ObserverFunction[]
-        info = PlotInfo(plot, handle, transform_obs, obs_funcs, count, per_instance_mats)
+        # For per-instance materials, we track the starting InstanceDescriptor index
+        # because each instance has a different blas_index
+        info = PlotInfo(plot, handle, transform_obs, obs_funcs, count, per_instance_mats, first_descriptor_idx)
         push!(plot_infos, info)
     end
 
@@ -808,7 +787,14 @@ function convert_scene_with_state(mscene::Makie.Scene)
         error("Must have at least one light")
     end
 
-    state = TraceMakieState(tlas, materials, plot_infos, lights, film, camera, false)
+    # Convert lights to tuple for type stability
+    lights_tuple = Tuple(lights)
+
+    # Create cached hikari scene
+    material_scene = Hikari.MaterialScene(tlas, materials)
+    hikari_scene = Hikari.Scene(lights, material_scene)
+
+    state = TraceMakieState(tlas, materials, plot_infos, lights_tuple, film, camera, false, hikari_scene)
 
     # Register transform observers
     for info in plot_infos
@@ -1100,8 +1086,7 @@ end
 # Keep the old convert_scene for backwards compatibility
 function convert_scene(mscene::Makie.Scene)
     state = convert_scene_with_state(mscene)
-    hikari_scene = get_hikari_scene(state)
-    return hikari_scene, state.camera, state.film
+    return state.hikari_scene, state.camera, state.film
 end
 
 """
@@ -1148,7 +1133,7 @@ end
     sync_meshscatter_transforms_individual!(state::TraceMakieState, info::PlotInfo)
 
 Update transforms for a MeshScatter plot with per-instance materials.
-Each instance is stored separately, so we update them one by one.
+Each instance is stored separately with its own BLAS, so we update them by index range.
 """
 function sync_meshscatter_transforms_individual!(state::TraceMakieState, info::PlotInfo)
     plot = info.plot
@@ -1159,14 +1144,12 @@ function sync_meshscatter_transforms_individual!(state::TraceMakieState, info::P
 
     transforms = meshscatter_transforms(positions, markersize, rotation, plot_transform)
 
-    # Find all instances for this handle and update them individually
-    # The instances are stored consecutively starting from the handle's blas_index
-    blas_idx = info.handle.blas_index
-    inst_idx = 1
-    for (i, inst) in enumerate(state.tlas.instances)
-        if inst.blas_index == blas_idx && inst_idx <= length(transforms)
-            Raycore.update_instance_transform!(state.tlas, i, transforms[inst_idx])
-            inst_idx += 1
+    # For per-instance materials, instances are stored consecutively starting at first_instance_idx
+    # Each particle has its own BLAS, so we can't search by blas_index
+    first_idx = info.first_instance_idx
+    for i in 1:info.instance_count
+        if i <= length(transforms)
+            Raycore.update_instance_transform!(state.tlas, first_idx + i - 1, transforms[i])
         end
     end
 end
@@ -1179,9 +1162,8 @@ Render a single frame using the current state. Syncs transforms and refits TLAS 
 function render_frame!(state::TraceMakieState; samples_per_pixel=1, max_depth=5)
     refit_if_needed!(state)
     Hikari.clear!(state.film)
-    scene = get_hikari_scene(state)
     integrator = Hikari.WhittedIntegrator(Hikari.UniformSampler(samples_per_pixel), max_depth)
-    integrator(scene, state.film, state.camera[])
+    integrator(state.hikari_scene, state.film, state.camera[])
     return state.film.framebuffer
 end
 
@@ -1247,7 +1229,7 @@ function render_interactive(mscene::Makie.Scene; backend, max_depth=5)
 end
 
 # Export TraceMakie-specific types
-export Screen, ScreenConfig, Whitted, SPPM, activate!, colorbuffer
+export Screen, ScreenConfig, Whitted, activate!, colorbuffer
 
 # re-export Makie, including deprecated names
 for name in names(Makie, all=true)
