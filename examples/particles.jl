@@ -1,22 +1,9 @@
-# ==============================================================================
-# Particle Simulation with TraceMakie - 10k Instanced Spheres
-# ==============================================================================
-#
-# This example demonstrates efficient particle rendering using MeshScatter:
-# - 10,000 sphere particles sharing a single BLAS via TLAS instancing
-# - Dynamic position updates each frame using update!()
-# - Velocity-based coloring (heat map effect)
-#
-# Usage:
-#   include("particles.jl")
-#
-
-using Revise
 using Makie, TraceMakie
 using GeometryBasics
 using LinearAlgebra
 using Colors
 using Hikari
+using AMDGPU
 
 # ==============================================================================
 # Particle System
@@ -232,28 +219,33 @@ function record_particles(filename::String="particles.mp4";
         n_particles::Int=1000,
         n_frames::Int=120,
         dt::Float32=1.0f0/30.0f0,
-        samples_per_pixel::Int=8)
+        samples_per_pixel::Int=8,
+        preset="ultrafast",
+        backend=Array
+    )
 
     println("Creating particle scene with $n_particles particles...")
     scene, ps, mplot = create_particle_scene(n_particles)
 
     # Activate TraceMakie backend
     TraceMakie.activate!(;
-        integrator=TraceMakie.Whitted(samples_per_pixel=samples_per_pixel, max_depth=3), tonemap=:aces, exposure=2
+        integrator=Hikari.FastWavefront(samples_per_pixel=samples_per_pixel),
+        backend=backend,
+        tonemap=:aces, exposure=1.0
     )
 
     println("Recording $n_frames frames to $filename...")
 
-    record(scene, filename, 1:n_frames; framerate=30) do frame
+    record(scene, filename, 1:n_frames; framerate=30, preset=preset) do frame
         # Step physics
-        step!(ps, dt)
+        @time step!(ps, dt)
 
         # Update the meshscatter plot using update!
         # Note: positions are stored as arg1 in Makie's compute graph
         new_positions = get_positions(ps)
         new_sizes = get_sizes(ps)
 
-        update!(mplot;
+        @time update!(mplot;
             arg1=new_positions,
             markersize=new_sizes
         )
@@ -273,7 +265,7 @@ function render_test_frame(;n_particles::Int=100, samples_per_pixel::Int=4, max_
     scene, ps, mplot = create_particle_scene(n_particles)
 
     screen = TraceMakie.Screen(scene;
-        integrator=TraceMakie.Whitted(samples_per_pixel=samples_per_pixel, max_depth=max_depth)
+        integrator=Hikari.Whitted(samples_per_pixel=samples_per_pixel, max_depth=max_depth)
     )
 
     println("Rendering...")
@@ -282,18 +274,16 @@ function render_test_frame(;n_particles::Int=100, samples_per_pixel::Int=4, max_
     return img, scene, ps, mplot, screen
 end
 
-n_particles = 100
+n_particles = 2000
 scene, ps, mplot = create_particle_scene(n_particles)
-
 screen = TraceMakie.Screen(scene;
-    integrator=TraceMakie.Whitted(samples_per_pixel=8, max_depth=2)
+    integrator=Hikari.WhittedIntegrator(Hikari.UniformSampler(8), 3), backend=ROCArray,
 )
 img = @time Makie.colorbuffer(screen)
-img
 img_bright = TraceMakie.postprocess!(screen; exposure=2)
-img_filmic = TraceMakie.postprocess!(screen; tonemap=:aces, exposure=2)
+img_filmic = TraceMakie.postprocess!(screen; tonemap=:aces, exposure=1)
 img_low_gamma = TraceMakie.postprocess!(screen; gamma=1.8)
-record_particles("particles.mp4"; n_frames=120, samples_per_pixel=8)
+record_particles("particles.mp4"; n_frames=120, samples_per_pixel=8, backend=ROCArray)
 # ==============================================================================
 # Main
 # ==============================================================================

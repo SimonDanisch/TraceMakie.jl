@@ -12,8 +12,7 @@ begin
     cam3d!(scene)
     mesh!(scene, catmesh, color=load(Makie.assetpath("diffusemap.png")))
     center!(scene)
-    TraceMakie.render_whitted(scene; samples_per_pixel=8)
-    # display(scene; backend=RPRMakie)
+    display(scene; backend=TraceMakie, integrator=Hikari.Hikari.WhittedIntegrator(Hikari.UniformSampler(8), 5))
     # @b TraceMakie.render_gpu(scene, ROCArray; samples_per_pixel=1)
     # 1.024328 seconds (16.94 M allocations: 5.108 GiB, 46.19% gc time, 81 lock conflicts)
     # 0.913530 seconds (16.93 M allocations: 5.108 GiB, 42.52% gc time, 57 lock conflicts)
@@ -26,6 +25,7 @@ begin
     # 103.273 ms (75501 allocations: 86.48 MiB)
     # TraceMakie.render_interactive(scene; backend=GLMakie, max_depth=5)
 end
+display(scene; backend=TraceMakie, integrator=Hikari.Hikari.FastWavefront())
 
 using ImageShow, AMDGPU
 

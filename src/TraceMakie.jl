@@ -1,6 +1,6 @@
 module TraceMakie
 
-using Makie, Hikari, Colors, LinearAlgebra, GeometryBasics, Raycore
+using Makie, Hikari, Colors, LinearAlgebra, GeometryBasics, Raycore, KernelAbstractions
 using Makie: Observable, on, colorbuffer, to_value
 using Makie: Quaternionf
 using GeometryBasics: VecTypes
@@ -36,18 +36,23 @@ Configuration for TraceMakie rendering.
   - `:filmic` - Hejl-Dawson filmic
   - `nothing` - No tonemapping (linear clamp)
 * `gamma`: Gamma correction value (default: 2.2, use `nothing` to skip)
+* `backend`: Array type for rendering (default: `Array` for CPU)
+  - `Array` - CPU rendering
+  - `ROCArray` - AMD GPU via AMDGPU.jl
+  - `CuArray` - NVIDIA GPU via CUDA.jl
 """
 struct ScreenConfig
-    integrator::Hikari.SamplerIntegrator
+    integrator::Hikari.Integrator
     exposure::Float32
     tonemap::Union{Symbol, Nothing}
     gamma::Union{Float32, Nothing}
+    backend::Type  # Array type: Array for CPU, ROCArray/CuArray for GPU
 
-    function ScreenConfig(integrator, exposure, tonemap, gamma)
+    function ScreenConfig(integrator, exposure, tonemap, gamma, backend=Array)
         actual_integrator = integrator isa Makie.Automatic ? Whitted() : integrator
         actual_exposure = Float32(exposure)
         actual_gamma = isnothing(gamma) ? nothing : Float32(gamma)
-        return new(actual_integrator, actual_exposure, tonemap, actual_gamma)
+        return new(actual_integrator, actual_exposure, tonemap, actual_gamma, backend)
     end
 end
 
@@ -69,11 +74,9 @@ mutable struct PlotInfo
     instance_count::Int  # Number of instances (>1 for MeshScatter)
     per_instance_materials::Bool  # True if each instance has separate material (no batched transforms)
     first_instance_idx::Int  # Starting index in TLAS.instances for per-instance materials
+    PlotInfo(plot, handle, transform_obs, obs_funcs, count=1, per_inst=false, first_idx=0) = new(plot, handle, transform_obs, obs_funcs, count, per_inst, first_idx)
 end
 
-PlotInfo(plot, handle, transform_obs, obs_funcs) = PlotInfo(plot, handle, transform_obs, obs_funcs, 1, false, 0)
-PlotInfo(plot, handle, transform_obs, obs_funcs, count) = PlotInfo(plot, handle, transform_obs, obs_funcs, count, false, 0)
-PlotInfo(plot, handle, transform_obs, obs_funcs, count, per_inst, first_idx) = PlotInfo(plot, handle, transform_obs, obs_funcs, count, per_inst, first_idx)
 
 """
     TraceMakieState
@@ -82,15 +85,16 @@ Holds the state needed to synchronize a Makie scene with a Hikari ray tracing sc
 Supports dynamic updates to transformations via TLAS refit.
 """
 mutable struct TraceMakieState
-    tlas::Raycore.TLAS
-    materials::Tuple  # Tuple of material vectors (for MaterialScene)
     plot_infos::Vector{PlotInfo}
-    lights::Tuple  # Tuple of lights (type-stable for rendering)
-    film::Hikari.Film
+    film::Hikari.Film  # Can be CPU (Array) or GPU (ROCArray/CuArray) - types differentiate
     camera::Observable
     needs_refit::Bool  # Flag to track if TLAS needs refit
-    hikari_scene::Hikari.Scene  # Cached scene to avoid recreating on each render
+    hikari_scene::Hikari.Scene  # Contains the TLAS via hikari_scene.aggregate.accel
+    preserve::Vector{Any}  # Keep GPU arrays alive (empty for CPU)
 end
+
+# Helper to get TLAS from state (it's inside hikari_scene.aggregate.accel)
+get_tlas(state::TraceMakieState) = state.hikari_scene.aggregate.accel
 
 # =============================================================================
 # Screen
@@ -158,14 +162,12 @@ function render!(screen::Screen)
     # Sync transforms and refit TLAS if needed
     sync_transforms!(state)
 
-    # Clear film
+    # Clear film and render (scene/film are already CPU or GPU based on backend)
     Hikari.clear!(state.film)
-
-    # Render using integrator from config
     camera = state.camera[]
     screen.config.integrator(state.hikari_scene, state.film, camera)
 
-    return state.film.framebuffer
+    return state.film
 end
 
 function Makie.colorbuffer(screen::Screen, format::Makie.ImageStorageFormat = Makie.JuliaNative; figure = nothing)
@@ -173,9 +175,9 @@ function Makie.colorbuffer(screen::Screen, format::Makie.ImageStorageFormat = Ma
         display(screen, screen.scene; figure = figure)
     end
 
-    render!(screen)
+    @time render!(screen)
 
-    # Apply postprocessing (tonemapping, gamma, exposure)
+    # Apply postprocessing on GPU/CPU (tonemapping, gamma, exposure)
     config = screen.config
     Hikari.postprocess!(screen.state.film;
         exposure = config.exposure,
@@ -183,8 +185,9 @@ function Makie.colorbuffer(screen::Screen, format::Makie.ImageStorageFormat = Ma
         gamma = config.gamma
     )
 
-    # Convert postprocessed buffer to RGB{N0f8}
-    result = map(screen.state.film.postprocess) do c
+    # Copy postprocess buffer to CPU if on GPU, then convert to RGB{N0f8}
+    postprocess_cpu = Array(screen.state.film.postprocess)
+    result = map(postprocess_cpu) do c
         RGB{N0f8}(c.r, c.g, c.b)
     end
 
@@ -239,15 +242,16 @@ function postprocess!(screen::Screen;
     tm_val = ismissing(tonemap) ? screen.config.tonemap : tonemap
     gamma_val = isnothing(gamma) ? screen.config.gamma : Float32(gamma)
 
-    # Apply postprocessing
+    # Apply postprocessing (works on GPU or CPU)
     Hikari.postprocess!(screen.state.film;
         exposure = exp_val,
         tonemap = tm_val,
         gamma = gamma_val
     )
 
-    # Convert to RGB{N0f8}
-    result = map(screen.state.film.postprocess) do c
+    # Copy to CPU if on GPU, then convert to RGB{N0f8}
+    postprocess_cpu = Array(screen.state.film.postprocess)
+    result = map(postprocess_cpu) do c
         RGB{N0f8}(c.r, c.g, c.b)
     end
 
@@ -256,7 +260,7 @@ end
 
 function Base.display(screen::Screen, scene::Scene; figure = nothing, display_kw...)
     screen.scene = scene
-    screen.state = convert_scene_with_state(scene)
+    screen.state = convert_scene_with_state(scene, screen.config.backend)
     return screen
 end
 
@@ -264,7 +268,7 @@ function Base.insert!(screen::Screen, scene::Scene, plot::AbstractPlot)
     # For now, rebuild the entire state when plots change
     # Future: incremental updates
     if !isnothing(screen.state)
-        screen.state = convert_scene_with_state(scene)
+        screen.state = convert_scene_with_state(scene, screen.config.backend)
     end
     return screen
 end
@@ -298,14 +302,34 @@ TraceMakie.activate!(exposure = 1.5, tonemap = :reinhard, gamma = 2.2)
 ```
 """
 function activate!(; screen_config...)
+    # Register TraceMakie's default theme if not already registered
+    key = :TraceMakie
+    if !haskey(Makie.CURRENT_DEFAULT_THEME, key)
+        Makie.CURRENT_DEFAULT_THEME[key] = Makie.Attributes(
+            integrator = Makie.automatic,
+            exposure = 1.0f0,
+            tonemap = nothing,
+            gamma = nothing,
+            backend = Array
+        )
+    end
     Makie.set_screen_config!(TraceMakie, screen_config)
     Makie.set_active_backend!(TraceMakie)
     return
 end
 
 function __init__()
-    # Activate TraceMakie as the default backend when loaded
-    activate!()
+    # Register TraceMakie's default theme at init time (before activate)
+    key = :TraceMakie
+    if !haskey(Makie.CURRENT_DEFAULT_THEME, key)
+        Makie.CURRENT_DEFAULT_THEME[key] = Makie.Attributes(
+            integrator = Makie.automatic,
+            exposure = 1.0f0,
+            tonemap = nothing,
+            gamma = nothing,
+            backend = Array
+        )
+    end
     return
 end
 
@@ -325,7 +349,7 @@ Update a single plot's transform in the TLAS.
 """
 function update_plot_transform!(state::TraceMakieState, info::PlotInfo)
     transform = get_plot_transform(info.plot)
-    Raycore.update_transform!(state.tlas, info.handle, transform)
+    Raycore.update_transform!(get_tlas(state), info.handle, transform)
     state.needs_refit = true
 end
 
@@ -336,7 +360,7 @@ Refit the TLAS if any transforms have changed.
 """
 function refit_if_needed!(state::TraceMakieState)
     if state.needs_refit
-        Raycore.refit_tlas!(state.tlas)
+        Raycore.refit_tlas!(get_tlas(state))
         state.needs_refit = false
     end
 end
@@ -645,18 +669,23 @@ function build_materials_tuple(materials_list::Vector)
 end
 
 """
-    convert_scene_with_state(scene::Makie.Scene) -> TraceMakieState
+    convert_scene_with_state(scene::Makie.Scene, backend::Type=Array) -> TraceMakieState
 
 Convert a Makie scene to a TraceMakieState that supports dynamic transform updates.
 Automatically watches plot transformations and syncs to TLAS.
+
+The `backend` parameter specifies the array type:
+- `Array` (default): CPU rendering
+- `ROCArray`: AMD GPU rendering
+- `CuArray`: NVIDIA GPU rendering
 """
-function convert_scene_with_state(mscene::Makie.Scene)
+function convert_scene_with_state(mscene::Makie.Scene, backend::Type=Array)
     resolution = Point2f(size(mscene))
-    f = Hikari.LanczosSincFilter(Point2f(1.0f0), 3.0f0)
     film = Hikari.Film(
-        resolution,
-        Hikari.Bounds2(Point2f(0.0f0), Point2f(1.0f0)),
-        f, 1.0f0, 1.0f0,
+        resolution;
+        filter=Hikari.LanczosSincFilter(Point2f(1.0f0), 3.0f0),
+        crop_bounds=Hikari.Bounds2(Point2f(0.0f0), Point2f(1.0f0)),
+        diagonal=1.0f0, scale=1.0f0,
     )
 
     # Collect Instance objects and materials
@@ -787,14 +816,18 @@ function convert_scene_with_state(mscene::Makie.Scene)
         error("Must have at least one light")
     end
 
-    # Convert lights to tuple for type stability
-    lights_tuple = Tuple(lights)
-
-    # Create cached hikari scene
+    # Create hikari scene
     material_scene = Hikari.MaterialScene(tlas, materials)
     hikari_scene = Hikari.Scene(lights, material_scene)
 
-    state = TraceMakieState(tlas, materials, plot_infos, lights_tuple, film, camera, false, hikari_scene)
+    # Convert to GPU if backend is not Array
+    preserve = Any[]
+    if backend !== Array
+        hikari_scene = Hikari.to_gpu(backend, hikari_scene)
+        film = Hikari.to_gpu(backend, film)
+    end
+
+    state = TraceMakieState(plot_infos, film, camera, false, hikari_scene, preserve)
 
     # Register transform observers
     for info in plot_infos
@@ -1094,64 +1127,53 @@ end
 
 Sync all plot transforms to the TLAS and refit.
 Call this before rendering if transforms may have changed.
+
+Uses GPU-compatible index-based updates that work on both CPU and GPU TLAS.
 """
 function sync_transforms!(state::TraceMakieState)
+    tlas = get_tlas(state)
+    # Get backend from film's framebuffer (works for both CPU and GPU)
+    backend = KernelAbstractions.get_backend(state.film.framebuffer)
+
     for info in state.plot_infos
-        if info.instance_count > 1 && info.plot isa Makie.MeshScatter && !info.per_instance_materials
-            # MeshScatter with shared material: update all instance transforms at once
-            sync_meshscatter_transforms!(state, info)
-        elseif info.instance_count > 1 && info.per_instance_materials
-            # Per-instance materials: each instance is separate, update individually
-            sync_meshscatter_transforms_individual!(state, info)
+        if info.instance_count > 1 && info.plot isa Makie.MeshScatter
+            # MeshScatter: update all instance transforms using batch kernel
+            sync_meshscatter_transforms!(state, info, backend)
         else
-            # Regular plot: single transform update
+            # Regular plot: single transform update using batch kernel with count=1
             transform = get_plot_transform(info.plot)
-            Raycore.update_transform!(state.tlas, info.handle, transform)
+            transforms = KernelAbstractions.allocate(backend, Mat4f, 1)
+            copyto!(transforms, [transform])
+            Raycore.update_instance_transforms!(tlas, transforms, 1, info.first_instance_idx)
         end
     end
-    Raycore.refit_tlas!(state.tlas)
+    Raycore.refit_tlas!(tlas; backend=backend)
     state.needs_refit = false
 end
 
 """
-    sync_meshscatter_transforms!(state::TraceMakieState, info::PlotInfo)
+    sync_meshscatter_transforms!(state::TraceMakieState, info::PlotInfo, backend)
 
-Update all instance transforms for a MeshScatter plot with shared material.
+Update all instance transforms for a MeshScatter plot.
+Uses GPU-compatible batch kernel with offset support.
 """
-function sync_meshscatter_transforms!(state::TraceMakieState, info::PlotInfo)
+function sync_meshscatter_transforms!(state::TraceMakieState, info::PlotInfo, backend)
     plot = info.plot
     positions = to_value(plot.positions)
     markersize = to_value(plot.markersize)
     rotation = to_value(plot.rotation)
     plot_transform = get_plot_transform(plot)
 
-    transforms = meshscatter_transforms(positions, markersize, rotation, plot_transform)
-    Raycore.update_transforms!(state.tlas, info.handle, transforms)
-end
+    # Compute transforms on CPU
+    transforms_cpu = meshscatter_transforms(positions, markersize, rotation, plot_transform)
 
-"""
-    sync_meshscatter_transforms_individual!(state::TraceMakieState, info::PlotInfo)
+    # Convert to appropriate backend array type
+    transforms = KernelAbstractions.allocate(backend, Mat4f, length(transforms_cpu))
+    copyto!(transforms, transforms_cpu)
 
-Update transforms for a MeshScatter plot with per-instance materials.
-Each instance is stored separately with its own BLAS, so we update them by index range.
-"""
-function sync_meshscatter_transforms_individual!(state::TraceMakieState, info::PlotInfo)
-    plot = info.plot
-    positions = to_value(plot.positions)
-    markersize = to_value(plot.markersize)
-    rotation = to_value(plot.rotation)
-    plot_transform = get_plot_transform(plot)
-
-    transforms = meshscatter_transforms(positions, markersize, rotation, plot_transform)
-
-    # For per-instance materials, instances are stored consecutively starting at first_instance_idx
-    # Each particle has its own BLAS, so we can't search by blas_index
-    first_idx = info.first_instance_idx
-    for i in 1:info.instance_count
-        if i <= length(transforms)
-            Raycore.update_instance_transform!(state.tlas, first_idx + i - 1, transforms[i])
-        end
-    end
+    # Use batch kernel with offset (works on CPU and GPU)
+    tlas = get_tlas(state)
+    Raycore.update_instance_transforms!(tlas, transforms, info.instance_count, info.first_instance_idx)
 end
 
 """
@@ -1185,8 +1207,8 @@ end
 function render_gpu(mscene::Makie.Scene, ArrayType; samples_per_pixel=8, max_depth=5)
     scene, camera, film = convert_scene(mscene)
     integrator = Hikari.WhittedIntegrator(Hikari.UniformSampler(samples_per_pixel), max_depth)
-    # to_gpu returns (gpu_scene, preserve) - preserve keeps GPU arrays alive during kernel execution
-    gpu_scene, _preserve = Hikari.to_gpu(ArrayType, scene)
+    # to_gpu uses Raycore.PRESERVE global to keep GPU arrays alive during kernel execution
+    gpu_scene = Hikari.to_gpu(ArrayType, scene)
     gpu_film = Hikari.to_gpu(ArrayType, film)
     integrator(gpu_scene, gpu_film, camera[])
     # Copy result from GPU film back to CPU
