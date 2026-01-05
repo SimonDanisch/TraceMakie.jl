@@ -81,11 +81,12 @@ c = cameracontrols(s)
 update_cam!(s, c, Vec3f(100, 30, 80), Vec3f(0, 0, -10))
 figure = plot_lego_figure(s)
 begin
-    colorbuffer(s;
+    @time colorbuffer(s;
         backend=TraceMakie, exposure=1.0f0,
-        integrator=TraceMakie.Whitted(samples_per_pixel=16, max_depth=5),
+        integrator=TraceMakie.Whitted(samples=16, max_depth=5),
         tonemap=:aces,
         gamma=2.2f0,
+        px_per_unit=1f0
     )
 end
 
@@ -128,7 +129,7 @@ begin
     translations = LinRange(0, total_translation, nsteps)
 
     TraceMakie.activate!(
-        integrator = TraceMakie.Whitted(samples_per_pixel=8, max_depth=5),
+        integrator = TraceMakie.Whitted(samples=8, max_depth=5),
         exposure = 1.0f0,
         tonemap = :aces,
     )

@@ -5,7 +5,6 @@ using Colors
 using Hikari
 using AMDGPU
 
-@time rand(10000)
 # ==============================================================================
 # Particle System
 # ==============================================================================
@@ -223,7 +222,7 @@ function record_particles(filename::String="particles.mp4";
         samples_per_pixel::Int=8,
         preset="ultrafast",
         backend=Array,
-        integrator=Hikari.FastWavefront(samples_per_pixel=samples_per_pixel)
+        integrator=Hikari.FastWavefront(samples=samples_per_pixel)
     )
 
     println("Creating particle scene with $n_particles particles...")
@@ -233,7 +232,7 @@ function record_particles(filename::String="particles.mp4";
     TraceMakie.activate!(;
         integrator=integrator,
         backend=backend,
-        tonemap=:aces, exposure=1.0
+        tonemap=:aces, exposure=2.0
     )
 
     println("Recording $n_frames frames to $filename...")
@@ -257,5 +256,5 @@ function record_particles(filename::String="particles.mp4";
     println("Done! Video saved to $filename")
     return scene, ps, mplot
 end
-
-record_particles("particles.mp4"; n_frames=120, samples_per_pixel=8, n_particles=2000, backend=ROCArray)
+using AMDGPU
+record_particles("particles.mp4"; n_frames=2, samples_per_pixel=8, n_particles=2000, backend=ROCArray)

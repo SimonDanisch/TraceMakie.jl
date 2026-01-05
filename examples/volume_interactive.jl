@@ -115,7 +115,7 @@ function volume_interactive_dashboard(qlt, grid_extent, cloud_frames;
     Label(controls[14, 1:2], "Rotate: drag, Zoom: scroll", halign=:left, fontsize=11)
 
     # Right panel: 3D Scene
-    ax = LScene(fig[1, 2])
+    ax = LScene(fig[1, 2]; show_axis=false)
 
     # Set up camera to look at clouds with sky visible
     cloud_center_z = Float32(grid_extent[3]) * 0.3f0
@@ -131,18 +131,26 @@ function volume_interactive_dashboard(qlt, grid_extent, cloud_frames;
     # Use Observable for volume data so it can be updated
     vol_data_obs = Observable(initial_vol_data)
 
+    # Colormap: transparent for zero density, white for clouds
+    # Use RGBAf so GLMakie renders empty areas as transparent
+    cloud_cmap = [RGBAf(0, 0, 0, 0), RGBAf(1, 1, 1, 1)]
+
     vol_plot = volume!(ax, x_interval, y_interval, z_interval, vol_data_obs;
         material=(;
             extinction_scale=extinction_scale,
             asymmetry_g=asymmetry_g,
             single_scatter_albedo=single_scatter_albedo
-        )
+        ),
+        algorithm=:absorption, absorption=100f0,
+        colormap=cloud_cmap,
+        transparency=true
     )
 
     # Add SunSkyLight for physically-based sky and sun illumination
     sun_sky = Makie.SunSkyLight(sun_direction;
         intensity=sun_intensity,
-        turbidity=turbidity
+        turbidity=turbidity,
+        ground_enabled=false
     )
     Makie.push_light!(ax.scene, sun_sky)
 
@@ -160,14 +168,66 @@ function volume_interactive_dashboard(qlt, grid_extent, cloud_frames;
     println("  - Use sliders to adjust time and postprocessing")
 
     controls_handle = TraceMakie.render_interactive(ax.scene;
-        backend=GLMakie,
         max_depth=max_depth,
         exposure=exposure_slider.value,
         tonemap=tonemap_obs,
-        gamma=gamma_slider.value
+        gamma=gamma_slider.value,
     )
 
     return fig, ax, vol_plot, controls_handle
+end
+
+# =============================================================================
+# Simple Benchmark Scene (for profiling)
+# =============================================================================
+
+"""
+Create a simple volume scene for benchmarking TraceMakie rendering.
+Returns a Screen that can be used with colorbuffer(screen) for timing.
+"""
+function create_benchmark_scene(vol_data, grid_extent;
+    extinction_scale=10000f0,
+    samples=1,
+    max_depth=3,
+    resolution=(800, 600),
+    backend=Array)
+
+    scene = Scene(size=resolution)
+    cam3d!(scene)
+
+    # Volume bounds
+    x_interval = -1.0 .. 1.0
+    y_interval = -1.0 .. 1.0
+    z_interval = 0.0 .. Float64(grid_extent[3])
+
+    # Add volume with cloud material
+    volume!(scene, x_interval, y_interval, z_interval, vol_data;
+        material=(;
+            extinction_scale=extinction_scale,
+            asymmetry_g=0.85f0,
+            single_scatter_albedo=0.99f0
+        )
+    )
+
+    # Add SunSkyLight
+    sun_sky = Makie.SunSkyLight(Vec3f(0.4, 0.5, 0.85);
+        intensity=25.0f0,
+        turbidity=2.5f0,
+        ground_enabled=false
+    )
+    Makie.push_light!(scene, sun_sky)
+
+    # Position camera
+    cloud_center_z = Float32(grid_extent[3]) * 0.3f0
+    update_cam!(scene, Vec3f(3.0, 3.0, cloud_center_z), Vec3f(0, 0, cloud_center_z), Vec3f(0, 0, 1))
+
+    # Create Screen
+    integrator = TraceMakie.Whitted(samples=samples, max_depth=max_depth)
+    config = TraceMakie.ScreenConfig(integrator, 1.0f0, :aces, 2.2f0, backend)
+    screen = TraceMakie.Screen(nothing, nothing, config)
+    display(screen, scene)
+
+    return screen, scene
 end
 
 # =============================================================================
@@ -175,6 +235,10 @@ end
 # =============================================================================
 
 GLMakie.activate!()
+
+# Uncomment for interactive dashboard:
+using WGLMakie
+WGLMakie.activate!()
 fig, ax, vol_plot, controls = volume_interactive_dashboard(qlt, grid_extent, cloud_frames;
     extinction_scale=10000f0,
     asymmetry_g=0.85f0,
@@ -183,3 +247,11 @@ fig, ax, vol_plot, controls = volume_interactive_dashboard(qlt, grid_extent, clo
     max_depth=3
 )
 fig
+
+# Benchmark example (frame 5):
+vol_data = Float32.(interior(qlt[5]))
+screen, scene = create_benchmark_scene(vol_data, grid_extent; samples=1, max_depth=3)
+
+# Warmup
+@time colorbuffer(screen);
+@profview_allocs colorbuffer(screen);

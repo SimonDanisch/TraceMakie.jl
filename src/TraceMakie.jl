@@ -77,10 +77,23 @@ end
 
 
 """
+    PlotUpdateInfo
+
+Tracks a plot and its computed key for polling updates via the compute graph.
+The update function is registered in the plot's attributes and updates
+the corresponding Hikari material/geometry in-place when polled.
+"""
+struct PlotUpdateInfo
+    plot::Makie.AbstractPlot
+    computed_key::Symbol
+end
+
+"""
     TraceMakieState
 
 Holds the state needed to synchronize a Makie scene with a Hikari ray tracing scene.
-Supports dynamic updates to transformations via TLAS refit.
+Supports dynamic updates to transformations via TLAS refit, and material/geometry
+updates via the compute graph polling mechanism.
 """
 mutable struct TraceMakieState
     plot_infos::Vector{PlotInfo}
@@ -89,10 +102,161 @@ mutable struct TraceMakieState
     needs_refit::Bool  # Flag to track if TLAS needs refit
     hikari_scene::Hikari.AbstractScene  # Contains the TLAS via hikari_scene.aggregate.accel (Scene for CPU, ImmutableScene for GPU)
     preserve::Vector{Any}  # Keep GPU arrays alive (empty for CPU)
+    update_infos::Vector{PlotUpdateInfo}  # Track plots for compute graph polling
+    needs_film_clear::Bool  # Flag to indicate data changed and film should be cleared
 end
 
 # Helper to get TLAS from state (it's inside hikari_scene.aggregate.accel)
 get_tlas(state::TraceMakieState) = state.hikari_scene.aggregate.accel
+
+"""
+    register_plot_updates!(state::TraceMakieState, info::PlotInfo, material, material_idx)
+
+Register a plot for in-place material/geometry updates using the compute graph.
+This is called during scene conversion for each plot to set up reactive updates.
+
+When polled before rendering, the compute graph evaluates any dirty attributes
+and updates the corresponding Hikari structures in-place.
+"""
+function register_plot_updates!(state::TraceMakieState, info::PlotInfo, material, material_idx)
+    # Dispatch to plot-specific registration
+    _register_plot_updates!(state, info, material, material_idx)
+end
+
+# Default: no updates for unsupported plot types
+function _register_plot_updates!(state::TraceMakieState, info::PlotInfo, material, material_idx)
+    # No-op for plots without special update handling
+end
+
+# Volume plots: update density array in-place
+function _register_plot_updates!(state::TraceMakieState, info::PlotInfo, cloud::Hikari.CloudVolume, material_idx)
+    plot = info.plot
+    plot isa Makie.Plot{Makie.volume} || return
+    attr = plot.attributes
+    computed_key = :tracemakie_volume_update
+
+    # Skip if already registered (e.g., from previous colorbuffer call)
+    if haskey(attr, computed_key)
+        push!(state.update_infos, PlotUpdateInfo(plot, computed_key))
+        return
+    end
+
+    # Register computation that watches the volume data
+    # Must return a tuple with one element per output
+    Makie.register_computation!(attr, [:volume], [computed_key]) do (vol_data,), changed, cached
+        if changed.volume
+            # Volume data changed - update CloudVolume density in-place
+            if size(vol_data) == size(cloud.density)
+                cloud.density .= Float32.(vol_data)
+            else
+                @warn "Volume size mismatch: $(size(vol_data)) vs $(size(cloud.density))"
+            end
+            state.needs_film_clear = true
+            return (true,)
+        end
+        return isnothing(cached) ? (false,) : cached
+    end
+
+    push!(state.update_infos, PlotUpdateInfo(plot, computed_key))
+end
+
+# Generic material handler - dispatches based on plot type
+function _register_plot_updates!(state::TraceMakieState, info::PlotInfo, mat::Hikari.Material, material_idx)
+    plot = info.plot
+
+    # MeshScatter: update positions, markersize, rotation -> refit TLAS
+    if plot isa Makie.Plot{Makie.meshscatter} && info.instance_count > 1
+        attr = plot.attributes
+        computed_key = :tracemakie_meshscatter_update
+
+        # Skip if already registered (e.g., from previous colorbuffer call)
+        if haskey(attr, computed_key)
+            push!(state.update_infos, PlotUpdateInfo(plot, computed_key))
+            return
+        end
+
+        # Watch positions, markersize, and rotation
+        # Must return a tuple with one element per output
+        Makie.register_computation!(attr, [:positions, :markersize, :rotation], [computed_key]) do (positions, markersize, rotation), changed, cached
+            if changed.positions || changed.markersize || changed.rotation
+                state.needs_refit = true
+                state.needs_film_clear = true
+                return (true,)
+            end
+            return isnothing(cached) ? (false,) : cached
+        end
+
+        push!(state.update_infos, PlotUpdateInfo(plot, computed_key))
+
+    # Mesh: update color in-place (for materials with mutable Texture)
+    elseif plot isa Makie.Plot{Makie.mesh}
+        # Try to get the texture from the material for in-place updates
+        tex = _get_material_texture(mat)
+        if !isnothing(tex) && tex isa Hikari.Texture
+            attr = plot.attributes
+            computed_key = :tracemakie_mesh_color_update
+
+            # Skip if already registered
+            if haskey(attr, computed_key)
+                push!(state.update_infos, PlotUpdateInfo(plot, computed_key))
+                return
+            end
+
+            # Must return a tuple with one element per output
+            Makie.register_computation!(attr, [:color], [computed_key]) do (color,), changed, cached
+                if changed.color
+                    if color isa Colorant
+                        tex.data = to_spectrum(to_color(color))
+                    elseif color isa AbstractVector{<:Colorant}
+                        tex.data = to_spectrum.(color)
+                    elseif color isa AbstractMatrix{<:Colorant}
+                        tex.data = to_spectrum.(color)
+                    end
+                    state.needs_film_clear = true
+                    return (true,)
+                end
+                return isnothing(cached) ? (false,) : cached
+            end
+
+            push!(state.update_infos, PlotUpdateInfo(plot, computed_key))
+        end
+    end
+end
+
+# Helper to extract mutable texture from material (for in-place color updates)
+_get_material_texture(mat::Hikari.MatteMaterial) = mat.Kd isa Hikari.Texture ? mat.Kd : nothing
+_get_material_texture(mat::Hikari.PlasticMaterial) = mat.Kd isa Hikari.Texture ? mat.Kd : nothing
+_get_material_texture(mat::Hikari.MetalMaterial) = mat.reflectance isa Hikari.Texture ? mat.reflectance : nothing
+_get_material_texture(mat::Hikari.Material) = nothing
+
+"""
+    poll_updates!(state::TraceMakieState)
+
+Poll all registered plots for updates. This triggers the compute graph
+to evaluate any dirty attributes and update Hikari structures in-place.
+Should be called before each render frame.
+
+Returns true if any updates occurred (film should be cleared).
+"""
+function poll_updates!(state::TraceMakieState)
+    had_updates = false
+    for info in state.update_infos
+        # Access the computed node to trigger resolution
+        if haskey(info.plot.attributes, info.computed_key)
+            computed = info.plot.attributes[info.computed_key]
+            result = computed[]
+            # Result is a tuple like (true,) or (false,)
+            if result isa Tuple && length(result) >= 1 && result[1] === true
+                had_updates = true
+            end
+        end
+    end
+    if state.needs_film_clear
+        state.needs_film_clear = false
+        return true
+    end
+    return had_updates
+end
 
 # =============================================================================
 # Screen
@@ -474,29 +638,17 @@ function extract_material(plot::Plot, color_obs::Union{Makie.Computed, Observabl
         end
     end
 
+    # Create texture from color - updates are handled by compute graph registration
     tex = nothing
     if color isa AbstractMatrix{<:Number}
         # Use Makie's compute_colors to apply colormap
         computed = Makie.compute_colors(plot.attributes)
         tex = Hikari.Texture(to_spectrum(computed))
-        onany(plot, color_obs, plot.colormap, plot.colorrange) do color, cmap, crange
-            tex.data = to_spectrum(Makie.compute_colors(plot.attributes))
-            return
-        end
     elseif color isa AbstractMatrix{<:Colorant}
         tex = Hikari.Texture(to_spectrum(color))
-        onany(plot, color_obs) do color
-            tex.data = to_spectrum(color)
-            return
-        end
     elseif color isa AbstractVector{<:Colorant}
         # Per-instance colors (e.g., for meshscatter)
-        # Convert to spectrum array for per-instance materials
         tex = Hikari.Texture(to_spectrum.(color))
-        onany(plot, color_obs) do color
-            tex.data = to_spectrum.(color)
-            return
-        end
     elseif color isa Colorant || color isa Union{String,Symbol}
         tex = Hikari.ConstantTexture(to_spectrum(to_color(color)))
     elseif color isa Nothing
@@ -765,6 +917,7 @@ function to_trace_light(light::Makie.SunSkyLight)
         sun_intensity;
         turbidity=light.turbidity,
         ground_albedo=ground_albedo,
+        ground_enabled=light.ground_enabled,
     )
 end
 
@@ -870,6 +1023,10 @@ function convert_scene_with_state(mscene::Makie.Scene, backend::Type=Array)
     # because one Instance with N transforms creates N InstanceDescriptors
     total_instance_descriptors = 0
 
+    # Track plot-to-material mapping for registering updates later
+    # Maps plot -> (material, material_index)
+    plot_to_material = Dict{Makie.AbstractPlot, Tuple{Hikari.Material, Hikari.MaterialIndex}}()
+
     for plot in mscene.plots
         result = to_trace_primitive_with_transform(plot)
         if !isnothing(result)
@@ -896,16 +1053,31 @@ function convert_scene_with_state(mscene::Makie.Scene, backend::Type=Array)
                 end
 
                 plot_to_instance_info[plot] = (first_idx, n_instances, has_per_instance_mats, first_descriptor_idx)
+                # Track material for MeshScatter (for compute graph updates)
+                # Use first material for per-instance case, or the single material
+                mat_for_update = has_per_instance_mats ? first(result.materials) : result.materials
+                mat_idx_for_update = get_material_index(mat_for_update)
+                plot_to_material[plot] = (mat_for_update, mat_idx_for_update)
             elseif result isa Vector
                 # Multiple primitives from MetaMesh - each gets its own Instance
                 first_idx = length(instances) + 1
                 first_descriptor_idx = total_instance_descriptors + 1
+                first_mat = nothing
+                first_mat_idx = nothing
                 for (mesh, mat, transform) in result
                     mat_index = get_material_index(mat)
                     push!(instances, Raycore.Instance(mesh, transform, mat_index))
+                    if isnothing(first_mat)
+                        first_mat = mat
+                        first_mat_idx = mat_index
+                    end
                 end
                 total_instance_descriptors += length(result)
                 plot_to_instance_info[plot] = (first_idx, length(result), false, first_descriptor_idx)
+                # Track first material for MetaMesh (for compute graph updates)
+                if !isnothing(first_mat)
+                    plot_to_material[plot] = (first_mat, first_mat_idx)
+                end
             else
                 mesh, mat, transform = result
                 first_idx = length(instances) + 1
@@ -914,6 +1086,8 @@ function convert_scene_with_state(mscene::Makie.Scene, backend::Type=Array)
                 push!(instances, Raycore.Instance(mesh, transform, mat_index))
                 total_instance_descriptors += 1
                 plot_to_instance_info[plot] = (first_idx, 1, false, first_descriptor_idx)
+                # Track material for this plot (for compute graph updates)
+                plot_to_material[plot] = (mat, mat_index)
             end
         end
     end
@@ -975,7 +1149,7 @@ function convert_scene_with_state(mscene::Makie.Scene, backend::Type=Array)
         film = Hikari.to_gpu(backend, film)
     end
 
-    state = TraceMakieState(plot_infos, film, camera, false, hikari_scene, preserve)
+    state = TraceMakieState(plot_infos, film, camera, false, hikari_scene, preserve, PlotUpdateInfo[], false)
 
     # Register transform observers
     for info in plot_infos
@@ -983,6 +1157,15 @@ function convert_scene_with_state(mscene::Makie.Scene, backend::Type=Array)
             update_plot_transform!(state, info)
         end
         push!(info.obs_funcs, obs_func)
+    end
+
+    # Register compute graph updates for each plot
+    # Build a lookup from plot to PlotInfo
+    plot_to_info = Dict{Makie.AbstractPlot, PlotInfo}(info.plot => info for info in plot_infos)
+    for (plot, (mat, mat_idx)) in plot_to_material
+        if haskey(plot_to_info, plot)
+            register_plot_updates!(state, plot_to_info[plot], mat, mat_idx)
+        end
     end
 
     return state
@@ -1365,13 +1548,16 @@ end
 
 
 """
-    render_interactive(mscene; backend, max_depth=5, exposure=1.0f0, tonemap=:aces, gamma=1.2f0)
+    render_interactive(mscene; backend, max_depth=5, exposure=1.0f0, tonemap=:aces, gamma=1.2f0, render_backend=Array)
 
 Start an interactive ray-tracing render loop for a Makie scene.
 
 The render loop continuously updates as the camera moves. Uses progressive rendering
 with 1 sample per pixel per frame, accumulating samples over time for noise reduction.
-When the camera moves, the film is cleared and accumulation restarts.
+When the camera moves or plot data changes, the film is cleared and accumulation restarts.
+
+Plot data changes (volume data, material parameters, etc.) are detected via the compute graph
+polling mechanism - no Observable callbacks needed.
 
 Postprocessing parameters (exposure, tonemap, gamma) can be Observables for reactive updates.
 
@@ -1382,25 +1568,31 @@ Postprocessing parameters (exposure, tonemap, gamma) can be Observables for reac
 - `exposure=1.0f0`: Exposure value (can be Observable)
 - `tonemap=:aces`: Tonemapping method (can be Observable, options: :aces, :reinhard, :filmic, nothing)
 - `gamma=1.2f0`: Gamma correction (can be Observable)
+- `render_backend=Array`: Array type for rendering (Array for CPU, ROCArray/CuArray for GPU)
 
 # Returns
 A named tuple with handles for controlling the render:
 - `stop`: Function to stop the render loop
-- `reconvert`: Function to force scene reconversion (call after changing volume data)
 """
-function render_interactive(mscene::Makie.Scene; backend, max_depth=5,
-                            exposure=1.0f0, tonemap=:aces, gamma=1.2f0)
+function render_interactive(mscene::Makie.Scene; max_depth=5,
+                            exposure=1.0f0, tonemap=:aces, gamma=1.2f0, render_backend=Array)
     # Wrap non-Observable parameters in Observables for uniform handling
     exposure_obs = exposure isa Observable ? exposure : Observable(exposure)
     tonemap_obs = tonemap isa Observable ? tonemap : Observable(tonemap)
     gamma_obs = gamma isa Observable ? gamma : Observable(gamma)
 
-    # Convert scene for TraceMakie first (before modifying visibility)
-    scene_ref = Ref(convert_scene(mscene))
-    scene, camera, film = scene_ref[]
+    # Create integrator - always 1 spp for progressive rendering
+    integrator = Hikari.Whitted(samples=1, max_depth=max_depth)
 
-    # Track if scene needs reconversion
-    needs_reconvert = Ref(false)
+    # Create Screen with proper backend configuration
+    config = ScreenConfig(integrator, Float32(exposure_obs[]), tonemap_obs[], gamma_obs[], render_backend)
+    screen = Screen(nothing, nothing, config)
+
+    # Initialize state via display
+    display(screen, mscene)
+    state = screen.state
+    film = state.film
+    camera = state.camera
 
     # Hide volume plots for GLMakie display (they'll be ray-traced)
     volume_plots = [p for p in mscene.plots if p isa Makie.Volume]
@@ -1416,12 +1608,8 @@ function render_interactive(mscene::Makie.Scene; backend, max_depth=5,
     end
 
     imsub = Scene(mscene)
-    # Use postprocess buffer for display (includes tonemapping)
-    imgp = image!(imsub, -1 .. 1, -1 .. 1, film.postprocess, uv_transform=(:rotr90, :flip_y))
-    # Always use 1 sample per pixel for progressive rendering
-    # The render loop accumulates samples over time
-    integrator = Hikari.Whitted(samples=1, max_depth=max_depth)
-    display(mscene; backend=backend)
+    display_buffer = film.postprocess
+    imgp = image!(imsub, -1 .. 1, -1 .. 1, Array(display_buffer), uv_transform=(:rotr90, :flip_y))
 
     # Restore SunSkyLight after display
     for l in sun_sky_lights
@@ -1433,18 +1621,6 @@ function render_interactive(mscene::Makie.Scene; backend, max_depth=5,
         p.visible[] = true
     end
 
-    # Set up observers for volume plot changes
-    for p in volume_plots
-        on(p.volume) do _
-            needs_reconvert[] = true
-        end
-        if haskey(p, :material)
-            on(p.material) do _
-                needs_reconvert[] = true
-            end
-        end
-    end
-
     cam_start = camera[]
     loki = Threads.ReentrantLock()
     cam_rendered = camera[]
@@ -1452,24 +1628,15 @@ function render_interactive(mscene::Makie.Scene; backend, max_depth=5,
 
     # Main render loop
     Base.errormonitor(Threads.@spawn while running[] && !Makie.isclosed(mscene)
-        # Check if scene needs reconversion
-        if needs_reconvert[]
-            needs_reconvert[] = false
+        # Poll for plot data updates (volume data, material changes, etc.)
+        # This triggers the compute graph to apply any pending in-place updates
+        if poll_updates!(state)
+            # Data changed - clear film to restart accumulation
+            Hikari.clear!(film)
             lock(loki) do
                 imgp.visible = false
             end
-            # Reconvert scene (volumes may have changed)
-            scene_ref[] = convert_scene(mscene)
-            scene, camera, film = scene_ref[]
-            # Update image to use new film buffer
-            lock(loki) do
-                imgp[3] = film.postprocess
-            end
-            cam_rendered = camera[]
         end
-
-        # Get current scene state
-        scene, camera, film = scene_ref[]
 
         # Check camera change
         if cam_rendered != camera[]
@@ -1480,8 +1647,8 @@ function render_interactive(mscene::Makie.Scene; backend, max_depth=5,
             end
         end
 
-        # Render
-        @time integrator(scene, film, camera[])
+        # Render using screen's integrator
+        @time screen.config.integrator(state.hikari_scene, film, camera[])
 
         # Apply postprocessing with current observable values
         current_tonemap = tonemap_obs[]
@@ -1489,28 +1656,27 @@ function render_interactive(mscene::Makie.Scene; backend, max_depth=5,
         Hikari.postprocess!(film; exposure=Float32(exposure_obs[]), tonemap=tonemap_sym, gamma=Float32(gamma_obs[]))
 
         lock(loki) do
-            imgp[3] = film.postprocess
+            imgp[3] = Array(film.postprocess)
             imgp.visible = true
         end
-        sleep(1/60)
+        sleep(1/30)
     end)
 
     # Camera visibility thread
     Base.errormonitor(Threads.@spawn while running[] && !Makie.isclosed(mscene)
-        _, current_camera, _ = scene_ref[]
         lock(loki) do
-            if cam_start != current_camera[]
-                cam_start = current_camera[]
+            if cam_start != camera[]
+                cam_start = camera[]
                 imgp.visible = false
             end
         end
-        sleep(1/60)
+        sleep(1/30)
     end)
 
     # Return control handles
     return (
         stop = () -> (running[] = false),
-        reconvert = () -> (needs_reconvert[] = true),
+        screen = screen,
     )
 end
 
