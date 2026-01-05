@@ -65,42 +65,53 @@ end
 # Setup scene with lights
 # Point light uses inverse-square falloff, so radiance needs to account for distance
 # Light at ~150 units from figure, so radiance ~150^2 = 22500 for unit intensity at figure
-radiance = 1500f0
+
+# =============================================================================
+# Render with Whitted integrator (fast, direct lighting + specular)
+# =============================================================================
+radiance = 15000f0
 lights = [
     Makie.AmbientLight(RGBf(0.4, 0.4, 0.4)),
     Makie.PointLight(RGBf(radiance, radiance, radiance), Vec3f(150, 100, 200)),
 ]
-s = Scene(size = (500, 500); lights=lights)
+s = Scene(size=(500, 500); lights=lights)
 
 cam3d!(s)
 c = cameracontrols(s)
 update_cam!(s, c, Vec3f(100, 30, 80), Vec3f(0, 0, -10))
 figure = plot_lego_figure(s)
-
-# =============================================================================
-# Render with Whitted integrator (fast, direct lighting + specular)
-# =============================================================================
 begin
-    TraceMakie.activate!(
-        integrator = TraceMakie.Whitted(samples_per_pixel=16, max_depth=5),
-        exposure = 1.0f0,
-        tonemap = :aces,
-        gamma = 2f0,
+    colorbuffer(s;
+        backend=TraceMakie, exposure=1.0f0,
+        integrator=TraceMakie.Whitted(samples_per_pixel=16, max_depth=5),
+        tonemap=:aces,
+        gamma=2.2f0,
     )
-    save("lego_whitted.png", s; backend=TraceMakie)
 end
 
 # =============================================================================
 # Render with SPPM integrator (slower, global illumination + caustics)
 # =============================================================================
 begin
+    integrator = Hikari.SPPMIntegrator(0.07, 3, 200)
+
     TraceMakie.activate!(
-        integrator = TraceMakie.SPPM(search_radius=0.075f0, max_depth=5, iterations=200),
+        integrator = Hikari.SPPMIntegrator(search_radius=0.075f0, max_depth=5, iterations=200),
         exposure = 1.0f0,
         tonemap = :aces,
         gamma = 2f0
     )
     save("lego_sppm.png", s; backend=TraceMakie)
+end
+
+begin
+    TraceMakie.activate!(
+        integrator=Hikari.FastWavefront(),
+        exposure=1f0,
+        tonemap=:aces,
+        gamma=2.0
+    )
+    display(s; backend=TraceMakie)
 end
 
 # =============================================================================

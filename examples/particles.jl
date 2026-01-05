@@ -5,6 +5,7 @@ using Colors
 using Hikari
 using AMDGPU
 
+@time rand(10000)
 # ==============================================================================
 # Particle System
 # ==============================================================================
@@ -135,13 +136,13 @@ end
 # Scene Setup
 # ==============================================================================
 
-function create_particle_scene(n_particles::Int=1000)
+function create_particle_scene(n_particles::Int=1000; size=(1920, 1080))
     # Create particle system
     ps = ParticleSystem(n_particles)
 
     # Create Makie scene with 3D camera and lights
     # Matching wavefront_particles.jl setup
-    scene = Scene(size=(1920, 1080); camera=cam3d!,
+    scene = Scene(size=size; camera=cam3d!,
         lights=[
             # Key light from above
             PointLight(RGBf(800, 780, 750), Point3f(0, 0, 120)),
@@ -221,7 +222,8 @@ function record_particles(filename::String="particles.mp4";
         dt::Float32=1.0f0/30.0f0,
         samples_per_pixel::Int=8,
         preset="ultrafast",
-        backend=Array
+        backend=Array,
+        integrator=Hikari.FastWavefront(samples_per_pixel=samples_per_pixel)
     )
 
     println("Creating particle scene with $n_particles particles...")
@@ -229,7 +231,7 @@ function record_particles(filename::String="particles.mp4";
 
     # Activate TraceMakie backend
     TraceMakie.activate!(;
-        integrator=Hikari.FastWavefront(samples_per_pixel=samples_per_pixel),
+        integrator=integrator,
         backend=backend,
         tonemap=:aces, exposure=1.0
     )
@@ -238,18 +240,17 @@ function record_particles(filename::String="particles.mp4";
 
     record(scene, filename, 1:n_frames; framerate=30, preset=preset) do frame
         # Step physics
-        @time step!(ps, dt)
+        step!(ps, dt)
 
         # Update the meshscatter plot using update!
         # Note: positions are stored as arg1 in Makie's compute graph
         new_positions = get_positions(ps)
         new_sizes = get_sizes(ps)
 
-        @time update!(mplot;
+        update!(mplot;
             arg1=new_positions,
             markersize=new_sizes
         )
-
         println("  Frame $frame/$n_frames")
     end
 
@@ -257,43 +258,4 @@ function record_particles(filename::String="particles.mp4";
     return scene, ps, mplot
 end
 
-"""
-Render a single frame for testing.
-"""
-function render_test_frame(;n_particles::Int=100, samples_per_pixel::Int=4, max_depth::Int=3)
-    println("Creating test scene with $n_particles particles...")
-    scene, ps, mplot = create_particle_scene(n_particles)
-
-    screen = TraceMakie.Screen(scene;
-        integrator=Hikari.Whitted(samples_per_pixel=samples_per_pixel, max_depth=max_depth)
-    )
-
-    println("Rendering...")
-    img = Makie.colorbuffer(screen)
-    println("Done! Image size: $(size(img))")
-    return img, scene, ps, mplot, screen
-end
-
-n_particles = 2000
-scene, ps, mplot = create_particle_scene(n_particles)
-screen = TraceMakie.Screen(scene;
-    integrator=Hikari.WhittedIntegrator(Hikari.UniformSampler(8), 3), backend=ROCArray,
-)
-img = @time Makie.colorbuffer(screen)
-img_bright = TraceMakie.postprocess!(screen; exposure=2)
-img_filmic = TraceMakie.postprocess!(screen; tonemap=:aces, exposure=1)
-img_low_gamma = TraceMakie.postprocess!(screen; gamma=1.8)
-record_particles("particles.mp4"; n_frames=120, samples_per_pixel=8, backend=ROCArray)
-# ==============================================================================
-# Main
-# ==============================================================================
-
-println("\nTraceMakie Particle Example")
-println("="^40)
-println("")
-println("To render a test frame:")
-println("  img, scene, ps, mplot, screen = render_test_frame(n_particles=100)")
-println("")
-println("To record an animation:")
-println("  record_particles(\"particles.mp4\"; n_particles=1000, n_frames=60)")
-println("")
+record_particles("particles.mp4"; n_frames=120, samples_per_pixel=8, n_particles=2000, backend=ROCArray)

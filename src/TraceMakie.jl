@@ -11,14 +11,10 @@ import Makie.Observables
 # ScreenConfig
 # =============================================================================
 
-# Convenience constructors for integrators
-"""
-    Whitted(; samples_per_pixel=8, max_depth=5)
-
-Create a Whitted-style ray tracing integrator. Fast but only handles direct lighting
-and perfect specular reflections/refractions.
-"""
-Whitted(; samples_per_pixel=8, max_depth=5) = Hikari.WhittedIntegrator(Hikari.UniformSampler(samples_per_pixel), max_depth)
+# Re-export integrators from Hikari for convenience
+const Whitted = Hikari.Whitted
+const SPPM = Hikari.SPPM
+const FastWavefront = Hikari.FastWavefront
 
 """
     ScreenConfig
@@ -26,7 +22,9 @@ Whitted(; samples_per_pixel=8, max_depth=5) = Hikari.WhittedIntegrator(Hikari.Un
 Configuration for TraceMakie rendering.
 
 * `integrator`: The integrator to use for rendering (default: `Whitted()`)
-  - `Whitted(; samples_per_pixel=8, max_depth=5)` - Fast Whitted-style ray tracing
+  - `Whitted(; samples=8, max_depth=5)` - Fast Whitted-style ray tracing
+  - `SPPM(; search_radius=0.075, max_depth=5, iterations=100)` - Stochastic progressive photon mapping
+  - `FastWavefront(; samples=4)` - GPU-optimized wavefront path tracing
 * `exposure`: Exposure multiplier for postprocessing (default: 1.0)
 * `tonemap`: Tonemapping method (default: :aces)
   - `:reinhard` - Simple Reinhard L/(1+L)
@@ -89,7 +87,7 @@ mutable struct TraceMakieState
     film::Hikari.Film  # Can be CPU (Array) or GPU (ROCArray/CuArray) - types differentiate
     camera::Observable
     needs_refit::Bool  # Flag to track if TLAS needs refit
-    hikari_scene::Hikari.Scene  # Contains the TLAS via hikari_scene.aggregate.accel
+    hikari_scene::Hikari.AbstractScene  # Contains the TLAS via hikari_scene.aggregate.accel (Scene for CPU, ImmutableScene for GPU)
     preserve::Vector{Any}  # Keep GPU arrays alive (empty for CPU)
 end
 
@@ -120,6 +118,28 @@ mutable struct Screen <: Makie.MakieScreen
     config::ScreenConfig
 end
 
+function Base.show(io::IO, screen::Screen)
+    scene_str = isnothing(screen.scene) ? "nothing" : "Scene($(size(screen.scene)))"
+    backend_name = nameof(screen.config.backend)
+    integrator_name = nameof(typeof(screen.config.integrator))
+    print(io, "Screen($scene_str, backend=$backend_name, integrator=$integrator_name)")
+end
+
+function Base.show(io::IO, ::MIME"text/plain", screen::Screen)
+    println(io, "TraceMakie.Screen")
+    if !isnothing(screen.scene)
+        println(io, "  Scene size: ", size(screen.scene))
+        if !isnothing(screen.state)
+            println(io, "  Plots: ", length(screen.state.plot_infos))
+        end
+    else
+        println(io, "  Scene: not attached")
+    end
+    println(io, "  Backend: ", nameof(screen.config.backend))
+    println(io, "  Integrator: ", nameof(typeof(screen.config.integrator)))
+    print(io, "  Exposure: ", screen.config.exposure)
+end
+
 Base.isopen(::Screen) = true
 Base.size(screen::Screen) = isnothing(screen.scene) ? (0, 0) : size(screen.scene)
 
@@ -146,7 +166,22 @@ end
 Screen(scene::Scene, config::ScreenConfig, ::IO, ::MIME) = Screen(scene, config)
 Screen(scene::Scene, config::ScreenConfig, ::Makie.ImageStorageFormat) = Screen(scene, config)
 
-Makie.apply_screen_config!(screen::Screen, ::ScreenConfig, args...) = screen
+function Makie.apply_screen_config!(screen::Screen, config::ScreenConfig, scene::Scene, args...)
+    # Check if backend changed - if so, we need to recreate the screen entirely
+    if screen.config.backend !== config.backend
+        # Backend changed, need new screen with new state
+        return Screen(scene, config)
+    end
+
+    # Check if integrator changed - if so, invalidate state to force re-render
+    if typeof(screen.config.integrator) !== typeof(config.integrator)
+        screen.state = nothing
+    end
+
+    # Update the config (postprocessing params like exposure/tonemap/gamma)
+    screen.config = config
+    return screen
+end
 Base.empty!(::Screen) = nothing
 
 # =============================================================================
@@ -170,12 +205,14 @@ function render!(screen::Screen)
     return state.film
 end
 
+using ImageCore
+
 function Makie.colorbuffer(screen::Screen, format::Makie.ImageStorageFormat = Makie.JuliaNative; figure = nothing)
     if isnothing(screen.state)
         display(screen, screen.scene; figure = figure)
     end
 
-    @time render!(screen)
+    render!(screen)
 
     # Apply postprocessing on GPU/CPU (tonemapping, gamma, exposure)
     config = screen.config
@@ -186,10 +223,7 @@ function Makie.colorbuffer(screen::Screen, format::Makie.ImageStorageFormat = Ma
     )
 
     # Copy postprocess buffer to CPU if on GPU, then convert to RGB{N0f8}
-    postprocess_cpu = Array(screen.state.film.postprocess)
-    result = map(postprocess_cpu) do c
-        RGB{N0f8}(c.r, c.g, c.b)
-    end
+    result = Array(map(clamp01nan, screen.state.film.postprocess))
 
     if format == Makie.GLNative
         return Makie.jl_to_gl_format(result)
@@ -295,7 +329,7 @@ $(Base.doc(ScreenConfig))
 TraceMakie.activate!()
 
 # Use Whitted with custom settings
-TraceMakie.activate!(integrator = TraceMakie.Whitted(samples_per_pixel=16, max_depth=8))
+TraceMakie.activate!(integrator = TraceMakie.Whitted(samples=16, max_depth=8))
 
 # Configure postprocessing
 TraceMakie.activate!(exposure = 1.5, tonemap = :reinhard, gamma = 2.2)
@@ -304,15 +338,6 @@ TraceMakie.activate!(exposure = 1.5, tonemap = :reinhard, gamma = 2.2)
 function activate!(; screen_config...)
     # Register TraceMakie's default theme if not already registered
     key = :TraceMakie
-    if !haskey(Makie.CURRENT_DEFAULT_THEME, key)
-        Makie.CURRENT_DEFAULT_THEME[key] = Makie.Attributes(
-            integrator = Makie.automatic,
-            exposure = 1.0f0,
-            tonemap = nothing,
-            gamma = nothing,
-            backend = Array
-        )
-    end
     Makie.set_screen_config!(TraceMakie, screen_config)
     Makie.set_active_backend!(TraceMakie)
     return
@@ -320,16 +345,7 @@ end
 
 function __init__()
     # Register TraceMakie's default theme at init time (before activate)
-    key = :TraceMakie
-    if !haskey(Makie.CURRENT_DEFAULT_THEME, key)
-        Makie.CURRENT_DEFAULT_THEME[key] = Makie.Attributes(
-            integrator = Makie.automatic,
-            exposure = 1.0f0,
-            tonemap = nothing,
-            gamma = nothing,
-            backend = Array
-        )
-    end
+    activate!()
     return
 end
 
@@ -460,10 +476,11 @@ function extract_material(plot::Plot, color_obs::Union{Makie.Computed, Observabl
 
     tex = nothing
     if color isa AbstractMatrix{<:Number}
-        calc_color = to_value(plot.calculated_colors)
-        tex = Hikari.Texture(to_spectrum(to_color(calc_color)))
+        # Use Makie's compute_colors to apply colormap
+        computed = Makie.compute_colors(plot.attributes)
+        tex = Hikari.Texture(to_spectrum(computed))
         onany(plot, color_obs, plot.colormap, plot.colorrange) do color, cmap, crange
-            tex.data = to_spectrum(to_color(calc_color))
+            tex.data = to_spectrum(Makie.compute_colors(plot.attributes))
             return
         end
     elseif color isa AbstractMatrix{<:Colorant}
@@ -589,24 +606,140 @@ function to_trace_primitive(plot::Makie.Surface)
     end
 
     positions = lift(grid, x, y, z, Makie.transform_func_obs(plot))
-    # normals = Makie.surface_normals(x[], y[], z[])
     r = Tesselation(Rect2f((0, 0), (1, 1)), size(z[]))
-    # decomposing a rectangle into uv and triangles is what we need to map the z coordinates on
-    # since the xyz data assumes the coordinates to have the same neighouring relations
-    # like a grid
     faces = decompose(GLTriangleFace, r)
     uv = decompose_uv(r)
-    # with this we can build a mesh
     mesh = normal_mesh(GeometryBasics.Mesh(vec(positions[]), faces, uv=uv))
 
     # Convert to TriangleMesh using Raycore
     tmesh = Raycore.TriangleMesh(mesh)
-    material = extract_material(plot, plot.z)
+
+    # Extract material - Surface uses z values for colormapping by default
+    # Use Makie's compute_colors to get the colormapped texture
+    material = extract_surface_material(plot)
     return Hikari.GeometricPrimitive(tmesh, material)
+end
+
+"""
+Extract material for Surface plots, using Makie's color computation system.
+"""
+function extract_surface_material(plot::Makie.Surface)
+    # Check if material is explicitly provided
+    has_material = haskey(plot, :material) && !isnothing(to_value(plot.material))
+    material_template = has_material ? to_value(plot.material) : nothing
+
+    # Get the color - Surface can have explicit color or use z values
+    color = to_value(plot.color)
+
+    if color isa AbstractMatrix{<:Colorant}
+        # Explicit color matrix provided
+        tex = Hikari.Texture(to_spectrum(color))
+    elseif color isa Colorant || color isa Union{String, Symbol}
+        # Single color for entire surface
+        tex = Hikari.ConstantTexture(to_spectrum(to_color(color)))
+    else
+        # Use Makie's compute_colors to get colormapped texture from z values
+        computed = Makie.compute_colors(plot.attributes)
+        tex = Hikari.Texture(to_spectrum(computed))
+    end
+
+    if material_template isa Hikari.Material
+        return merge_color_with_material(tex, material_template)
+    else
+        return Hikari.MatteMaterial(tex, Hikari.ConstantTexture(0.0f0))
+    end
 end
 
 function to_trace_primitive(plot::Makie.Plot)
     return nothing
+end
+
+"""
+Convert a Makie Volume plot to a CloudVolume material with bounding box mesh.
+
+The volume data is converted to a CloudVolume which uses ray marching for
+physically-based cloud/volume rendering with Henyey-Greenstein phase function.
+
+CloudVolume parameters are passed via the `material` attribute as a NamedTuple:
+```julia
+volume(x, y, z, data; material=(;
+    extinction_scale=10000f0,    # Controls optical density
+    asymmetry_g=0.85f0,          # HG phase function asymmetry (0.85 for clouds)
+    single_scatter_albedo=0.99f0 # Scattering vs absorption ratio
+))
+```
+"""
+function to_trace_primitive(plot::Makie.Volume)
+    !plot.visible[] && return nothing
+
+    # Get volume data from the .volume attribute
+    vol_data = to_value(plot.volume)
+
+    # Convert to Float32 density field
+    density = Float32.(vol_data)
+
+    # Get spatial extent from x, y, z attributes (EndPoints)
+    x = to_value(plot.x)
+    y = to_value(plot.y)
+    z = to_value(plot.z)
+
+    # EndPoints have .start and .stop, or can be indexed [1] and [2]
+    x_min, x_max = x[1], x[2]
+    y_min, y_max = y[1], y[2]
+    z_min, z_max = z[1], z[2]
+
+    origin = Point3f(x_min, y_min, z_min)
+    extent = Vec3f(x_max - x_min, y_max - y_min, z_max - z_min)
+
+    # Get CloudVolume parameters from material attribute (NamedTuple or Attributes)
+    mat_params = haskey(plot, :material) ? to_value(plot.material) : nothing
+
+    extinction_scale = 100.0f0
+    asymmetry_g = 0.85f0
+    single_scatter_albedo = 0.99f0
+
+    if mat_params isa NamedTuple
+        extinction_scale = Float32(get(mat_params, :extinction_scale, extinction_scale))
+        asymmetry_g = Float32(get(mat_params, :asymmetry_g, asymmetry_g))
+        single_scatter_albedo = Float32(get(mat_params, :single_scatter_albedo, single_scatter_albedo))
+    elseif mat_params isa Makie.Attributes
+        # Makie converts NamedTuple to Attributes - extract values
+        if haskey(mat_params, :extinction_scale)
+            extinction_scale = Float32(to_value(mat_params[:extinction_scale]))
+        end
+        if haskey(mat_params, :asymmetry_g)
+            asymmetry_g = Float32(to_value(mat_params[:asymmetry_g]))
+        end
+        if haskey(mat_params, :single_scatter_albedo)
+            single_scatter_albedo = Float32(to_value(mat_params[:single_scatter_albedo]))
+        end
+    end
+
+    # Create CloudVolume material
+    cloud = Hikari.CloudVolume(
+        density;
+        origin=origin,
+        extent=extent,
+        extinction_scale=extinction_scale,
+        asymmetry_g=asymmetry_g,
+        single_scatter_albedo=single_scatter_albedo
+    )
+
+    # Create bounding box mesh for the volume
+    cloud_box_geo = Rect3f(origin, extent)
+    cloud_box_mesh = Raycore.TriangleMesh(normal_mesh(cloud_box_geo))
+
+    return (cloud_box_mesh, cloud)
+end
+
+function to_trace_primitive_with_transform(plot::Makie.Volume)
+    prim = to_trace_primitive(plot)
+    if isnothing(prim)
+        return nothing
+    end
+    mesh, material = prim
+    # Volume coordinates are already in world space, use identity transform
+    return (mesh, material, Mat4f(LinearAlgebra.I))
 end
 
 function to_trace_light(light::Makie.AmbientLight)
@@ -619,6 +752,19 @@ end
 function to_trace_light(light::Makie.PointLight)
     return Hikari.PointLight(
         Vec3f(light.position), to_spectrum(light.color),
+    )
+end
+
+function to_trace_light(light::Makie.SunSkyLight)
+    # Convert Makie's SunSkyLight to Hikari's SunSkyLight
+    # Hikari expects sun_intensity as an RGBSpectrum, scaled by the intensity multiplier
+    sun_intensity = Hikari.RGBSpectrum(light.intensity)
+    ground_albedo = Hikari.RGBSpectrum(light.ground_albedo.r, light.ground_albedo.g, light.ground_albedo.b)
+    return Hikari.SunSkyLight(
+        Vec3f(light.direction),
+        sun_intensity;
+        turbidity=light.turbidity,
+        ground_albedo=ground_albedo,
     )
 end
 
@@ -804,8 +950,10 @@ function convert_scene_with_state(mscene::Makie.Scene, backend::Type=Array)
         isnothing(l) || push!(lights, l)
     end
 
-    # Add ambient light if present
-    if haskey(mscene.compute, :ambient_color)
+    # Add ambient light if present, but skip if we already have SunSkyLight
+    # (SunSkyLight provides its own ambient illumination from the sky)
+    has_sunsky = any(l -> l isa Hikari.SunSkyLight, lights)
+    if !has_sunsky && haskey(mscene.compute, :ambient_color)
         ambient_color = mscene.compute[:ambient_color][]
         if ambient_color != RGBf(0, 0, 0)
             push!(lights, Hikari.AmbientLight(to_spectrum(ambient_color)))
@@ -1177,21 +1325,21 @@ function sync_meshscatter_transforms!(state::TraceMakieState, info::PlotInfo, ba
 end
 
 """
-    render_frame!(state::TraceMakieState; samples_per_pixel=1, max_depth=5) -> Matrix
+    render_frame!(state::TraceMakieState; samples=1, max_depth=5) -> Matrix
 
 Render a single frame using the current state. Syncs transforms and refits TLAS if needed.
 """
-function render_frame!(state::TraceMakieState; samples_per_pixel=1, max_depth=5)
+function render_frame!(state::TraceMakieState; samples=1, max_depth=5)
     refit_if_needed!(state)
     Hikari.clear!(state.film)
-    integrator = Hikari.WhittedIntegrator(Hikari.UniformSampler(samples_per_pixel), max_depth)
+    integrator = Hikari.Whitted(samples=samples, max_depth=max_depth)
     integrator(state.hikari_scene, state.film, state.camera[])
     return state.film.framebuffer
 end
 
-function render_whitted(mscene::Makie.Scene; samples_per_pixel=8, max_depth=5)
+function render_whitted(mscene::Makie.Scene; samples=8, max_depth=5)
     scene, camera, film = convert_scene(mscene)
-    integrator = Hikari.WhittedIntegrator(Hikari.UniformSampler(samples_per_pixel), max_depth)
+    integrator = Hikari.Whitted(samples=samples, max_depth=max_depth)
     # Call integrator directly - it uses KernelAbstractions for CPU/GPU dispatch
     integrator(scene, film, camera[])
     return film.framebuffer
@@ -1199,14 +1347,14 @@ end
 
 function render_sppm(mscene::Makie.Scene; search_radius=0.075f0, max_depth=5, iterations=100)
     scene, camera, film = convert_scene(mscene)
-    integrator = Hikari.SPPMIntegrator(search_radius, max_depth, iterations, film)
+    integrator = Hikari.SPPM(search_radius=search_radius, max_depth=max_depth, iterations=iterations)
     integrator(scene, film, camera[])
     return film.framebuffer
 end
 
-function render_gpu(mscene::Makie.Scene, ArrayType; samples_per_pixel=8, max_depth=5)
+function render_gpu(mscene::Makie.Scene, ArrayType; samples=8, max_depth=5)
     scene, camera, film = convert_scene(mscene)
-    integrator = Hikari.WhittedIntegrator(Hikari.UniformSampler(samples_per_pixel), max_depth)
+    integrator = Hikari.Whitted(samples=samples, max_depth=max_depth)
     # to_gpu uses Raycore.PRESERVE global to keep GPU arrays alive during kernel execution
     gpu_scene = Hikari.to_gpu(ArrayType, scene)
     gpu_film = Hikari.to_gpu(ArrayType, film)
@@ -1216,38 +1364,154 @@ function render_gpu(mscene::Makie.Scene, ArrayType; samples_per_pixel=8, max_dep
 end
 
 
-function render_interactive(mscene::Makie.Scene; backend, max_depth=5)
-    scene, camera, film = convert_scene(mscene)
+"""
+    render_interactive(mscene; backend, max_depth=5, exposure=1.0f0, tonemap=:aces, gamma=1.2f0)
+
+Start an interactive ray-tracing render loop for a Makie scene.
+
+The render loop continuously updates as the camera moves. Uses progressive rendering
+with 1 sample per pixel per frame, accumulating samples over time for noise reduction.
+When the camera moves, the film is cleared and accumulation restarts.
+
+Postprocessing parameters (exposure, tonemap, gamma) can be Observables for reactive updates.
+
+# Arguments
+- `mscene::Makie.Scene`: The Makie scene to render
+- `backend`: The Makie backend to use for display (e.g., GLMakie)
+- `max_depth=5`: Maximum ray bounces
+- `exposure=1.0f0`: Exposure value (can be Observable)
+- `tonemap=:aces`: Tonemapping method (can be Observable, options: :aces, :reinhard, :filmic, nothing)
+- `gamma=1.2f0`: Gamma correction (can be Observable)
+
+# Returns
+A named tuple with handles for controlling the render:
+- `stop`: Function to stop the render loop
+- `reconvert`: Function to force scene reconversion (call after changing volume data)
+"""
+function render_interactive(mscene::Makie.Scene; backend, max_depth=5,
+                            exposure=1.0f0, tonemap=:aces, gamma=1.2f0)
+    # Wrap non-Observable parameters in Observables for uniform handling
+    exposure_obs = exposure isa Observable ? exposure : Observable(exposure)
+    tonemap_obs = tonemap isa Observable ? tonemap : Observable(tonemap)
+    gamma_obs = gamma isa Observable ? gamma : Observable(gamma)
+
+    # Convert scene for TraceMakie first (before modifying visibility)
+    scene_ref = Ref(convert_scene(mscene))
+    scene, camera, film = scene_ref[]
+
+    # Track if scene needs reconversion
+    needs_reconvert = Ref(false)
+
+    # Hide volume plots for GLMakie display (they'll be ray-traced)
+    volume_plots = [p for p in mscene.plots if p isa Makie.Volume]
+    for p in volume_plots
+        p.visible[] = false
+    end
+
+    # Temporarily remove SunSkyLight which GLMakie doesn't support
+    makie_lights = Makie.get_lights(mscene)
+    sun_sky_lights = [l for l in makie_lights if l isa Makie.SunSkyLight]
+    for l in sun_sky_lights
+        filter!(x -> x !== l, makie_lights)
+    end
+
     imsub = Scene(mscene)
-    imgp = image!(imsub, -1 .. 1, -1 .. 1, film.framebuffer, uv_transform=(:rotr90, :flip_y))
-    integrator = Hikari.WhittedIntegrator(Hikari.UniformSampler(1), max_depth)
+    # Use postprocess buffer for display (includes tonemapping)
+    imgp = image!(imsub, -1 .. 1, -1 .. 1, film.postprocess, uv_transform=(:rotr90, :flip_y))
+    # Always use 1 sample per pixel for progressive rendering
+    # The render loop accumulates samples over time
+    integrator = Hikari.Whitted(samples=1, max_depth=max_depth)
     display(mscene; backend=backend)
+
+    # Restore SunSkyLight after display
+    for l in sun_sky_lights
+        push!(makie_lights, l)
+    end
+
+    # Restore volume visibility (they'll be hidden by the overlay image anyway)
+    for p in volume_plots
+        p.visible[] = true
+    end
+
+    # Set up observers for volume plot changes
+    for p in volume_plots
+        on(p.volume) do _
+            needs_reconvert[] = true
+        end
+        if haskey(p, :material)
+            on(p.material) do _
+                needs_reconvert[] = true
+            end
+        end
+    end
+
     cam_start = camera[]
     loki = Threads.ReentrantLock()
     cam_rendered = camera[]
-    Base.errormonitor(Threads.@spawn while !Makie.isclosed(mscene)
+    running = Ref(true)
+
+    # Main render loop
+    Base.errormonitor(Threads.@spawn while running[] && !Makie.isclosed(mscene)
+        # Check if scene needs reconversion
+        if needs_reconvert[]
+            needs_reconvert[] = false
+            lock(loki) do
+                imgp.visible = false
+            end
+            # Reconvert scene (volumes may have changed)
+            scene_ref[] = convert_scene(mscene)
+            scene, camera, film = scene_ref[]
+            # Update image to use new film buffer
+            lock(loki) do
+                imgp[3] = film.postprocess
+            end
+            cam_rendered = camera[]
+        end
+
+        # Get current scene state
+        scene, camera, film = scene_ref[]
+
+        # Check camera change
         if cam_rendered != camera[]
             cam_rendered = camera[]
             Hikari.clear!(film)
-            imgp.visible = false
+            lock(loki) do
+                imgp.visible = false
+            end
         end
+
+        # Render
         @time integrator(scene, film, camera[])
+
+        # Apply postprocessing with current observable values
+        current_tonemap = tonemap_obs[]
+        tonemap_sym = current_tonemap isa Symbol ? current_tonemap : (isnothing(current_tonemap) ? nothing : Symbol(current_tonemap))
+        Hikari.postprocess!(film; exposure=Float32(exposure_obs[]), tonemap=tonemap_sym, gamma=Float32(gamma_obs[]))
+
         lock(loki) do
-            imgp[3] = film.framebuffer
+            imgp[3] = film.postprocess
             imgp.visible = true
         end
         sleep(1/60)
     end)
-    Base.errormonitor(Threads.@spawn while !Makie.isclosed(mscene)
+
+    # Camera visibility thread
+    Base.errormonitor(Threads.@spawn while running[] && !Makie.isclosed(mscene)
+        _, current_camera, _ = scene_ref[]
         lock(loki) do
-            if cam_start != camera[]
-                cam_start = camera[]
+            if cam_start != current_camera[]
+                cam_start = current_camera[]
                 imgp.visible = false
             end
         end
         sleep(1/60)
     end)
-    return
+
+    # Return control handles
+    return (
+        stop = () -> (running[] = false),
+        reconvert = () -> (needs_reconvert[] = true),
+    )
 end
 
 # Export TraceMakie-specific types
