@@ -1,6 +1,7 @@
 # Example inspiration and Lego model by https://github.com/Kevin-Mattheus-Moerman
 # https://twitter.com/KMMoerman/status/1417759722963415041
-using MeshIO, FileIO, GeometryBasics, TraceMakie, Makie
+using MeshIO, FileIO, GeometryBasics, TraceMakie, Makie, Hikari
+using AMDGPU
 
 colors = Dict(
     "eyes" => "#000",
@@ -62,79 +63,83 @@ function plot_lego_figure(s, floor = true)
     return figure
 end
 
+# =============================================================================
+# Integrator configurations
+# =============================================================================
+integrator_configs = [
+    (
+        backend = ROCArray,
+        exposure = 1.0f0,
+        integrator = TraceMakie.Whitted(samples=16, max_depth=5),
+        tonemap = :aces,
+        gamma = 2.2f0,
+    ),
+    (
+        backend = Array,
+        exposure = 1.0f0,
+        integrator = Hikari.FastWavefront(),
+        tonemap = :aces,
+        gamma = 2.0f0,
+    ),
+    (
+        backend = Array,
+        exposure = 1.0f0,
+        integrator = Hikari.SPPM(search_radius=0.075f0, max_depth=5, iterations=200),
+        tonemap = :aces,
+        gamma = 2.0f0,
+    ),
+]
+
+# =============================================================================
 # Setup scene with lights
+# =============================================================================
 # Point light uses inverse-square falloff, so radiance needs to account for distance
 # Light at ~150 units from figure, so radiance ~150^2 = 22500 for unit intensity at figure
+function create_scene()
+    radiance = 15000f0
+    lights = [
+        Makie.AmbientLight(RGBf(0.4, 0.4, 0.4)),
+        Makie.PointLight(RGBf(radiance, radiance, radiance), Vec3f(150, 100, 200)),
+    ]
+    s = Scene(size=(800*2, 800); lights=lights)
 
-# =============================================================================
-# Render with Whitted integrator (fast, direct lighting + specular)
-# =============================================================================
-radiance = 15000f0
-lights = [
-    Makie.AmbientLight(RGBf(0.4, 0.4, 0.4)),
-    Makie.PointLight(RGBf(radiance, radiance, radiance), Vec3f(150, 100, 200)),
-]
-s = Scene(size=(500, 500); lights=lights)
-
-cam3d!(s)
-c = cameracontrols(s)
-update_cam!(s, c, Vec3f(100, 30, 80), Vec3f(0, 0, -10))
-figure = plot_lego_figure(s)
-begin
-    @time colorbuffer(s;
-        backend=TraceMakie, exposure=1.0f0,
-        integrator=TraceMakie.Whitted(samples=16, max_depth=5),
-        tonemap=:aces,
-        gamma=2.2f0,
-        px_per_unit=1f0
-    )
+    cam3d!(s)
+    c = cameracontrols(s)
+    update_cam!(s, c, Vec3f(100, 30, 80), Vec3f(0, 0, -10))
+    figure = plot_lego_figure(s)
+    return s, figure
 end
 
 # =============================================================================
-# Render with SPPM integrator (slower, global illumination + caustics)
+# Render with each integrator
 # =============================================================================
-begin
-    integrator = Hikari.SPPMIntegrator(0.07, 3, 200)
-
-    TraceMakie.activate!(
-        integrator = Hikari.SPPMIntegrator(search_radius=0.075f0, max_depth=5, iterations=200),
-        exposure = 1.0f0,
-        tonemap = :aces,
-        gamma = 2f0
-    )
-    save("lego_sppm.png", s; backend=TraceMakie)
+images = map(integrator_configs[2:2]) do config
+    TraceMakie.activate!(; config...)
+    s, figure = create_scene()
+    name = nameof(typeof(config.integrator))
+    img = @time colorbuffer(s; backend=TraceMakie)
+    # println("Saving: lego_$(name).png")
+    # @time save("lego_$(name).png", img)
 end
-
-begin
-    TraceMakie.activate!(
-        integrator=Hikari.FastWavefront(),
-        exposure=1f0,
-        tonemap=:aces,
-        gamma=2.0
-    )
-    display(s; backend=TraceMakie)
-end
-
+images[1]
 # =============================================================================
-# Animation example with Whitted (faster for animation)
+# Animation with each integrator
 # =============================================================================
-begin
+let
+    config = integrator_configs[2]
+    TraceMakie.activate!(; config...)
+    s, figure = create_scene()
     rot_joints_by = 0.25 * pi
     total_translation = 50
     animation_strides = 10
 
     a1 = LinRange(0, rot_joints_by, animation_strides)
-    angles = [a1; reverse(a1[1:(end - 1)]); -a1[2:end]; reverse(-a1[1:(end - 1)])]
+    angles = [a1; reverse(a1[1:(end-1)]); -a1[2:end]; reverse(-a1[1:(end-1)])]
     nsteps = length(angles)
     translations = LinRange(0, total_translation, nsteps)
-
-    TraceMakie.activate!(
-        integrator = TraceMakie.Whitted(samples=8, max_depth=5),
-        exposure = 1.0f0,
-        tonemap = :aces,
-    )
-
-    @time Makie.record(s, "lego_walk.mp4", zip(translations, angles); backend=TraceMakie) do (translation, angle)
+    name = nameof(typeof(config.integrator))
+    println("Recording: lego_$(name).mp4")
+    @time Makie.record(s, "lego_$(name).mp4", zip(translations, angles); backend=TraceMakie) do (translation, angle)
         for name in ["arm_left", "arm_right", "leg_left", "leg_right"]
             Makie.rotate!(figure[name], rotation_axes[name], angle)
         end

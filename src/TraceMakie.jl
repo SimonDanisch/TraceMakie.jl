@@ -921,18 +921,42 @@ function to_trace_light(light::Makie.SunSkyLight)
     )
 end
 
+function to_trace_light(light::Makie.DirectionalLight)
+    # Convert Makie's DirectionalLight to Hikari's DirectionalLight
+    # Makie direction points TO light, Hikari direction is direction light TRAVELS
+    # So we need to negate
+    transform = Hikari.Transformation(Mat4f(I))
+    return Hikari.DirectionalLight(
+        transform,
+        to_spectrum(light.color),
+        -Vec3f(light.direction),  # Negate: Makie points TO light, Hikari is travel direction
+    )
+end
+
+function to_trace_light(light::Makie.EnvironmentLight)
+    # Convert Makie's EnvironmentLight to Hikari's EnvironmentLight
+    # Makie stores RGBf matrix, Hikari needs RGBSpectrum matrix
+    data = map(c -> Hikari.RGBSpectrum(c.r, c.g, c.b), light.image)
+    env_map = Hikari.EnvironmentMap(data, 0f0)
+    return Hikari.EnvironmentLight(env_map, Hikari.RGBSpectrum(light.intensity))
+end
+
 function to_trace_light(light)
     return nothing
 end
 
 function to_trace_camera(scene::Makie.Scene, film)
     cc = scene.camera_controls
+    # Calculate aspect ratio from film resolution
+    aspect = film.resolution[1] / film.resolution[2]
+    screen_window = Hikari.Bounds2(Point2f(-aspect, -1.0f0), Point2f(aspect, 1.0f0))
+
     return lift(scene, cc.eyeposition, cc.lookat, cc.upvector, cc.fov) do eyeposition, lookat, upvector, fov
         view = Hikari.look_at(
             Point3f(eyeposition), Point3f(lookat), Vec3f(upvector),
         )
         return Hikari.PerspectiveCamera(
-            view, Hikari.Bounds2(Point2f(-1.0f0), Point2f(1.0f0)),
+            view, screen_window,
             0.0f0, 1.0f0, 0.0f0, 1.0f6, Float32(fov),
             film
         )
@@ -1587,7 +1611,6 @@ function render_interactive(mscene::Makie.Scene; max_depth=5,
     # Create Screen with proper backend configuration
     config = ScreenConfig(integrator, Float32(exposure_obs[]), tonemap_obs[], gamma_obs[], render_backend)
     screen = Screen(nothing, nothing, config)
-
     # Initialize state via display
     display(screen, mscene)
     state = screen.state
@@ -1600,21 +1623,9 @@ function render_interactive(mscene::Makie.Scene; max_depth=5,
         p.visible[] = false
     end
 
-    # Temporarily remove SunSkyLight which GLMakie doesn't support
-    makie_lights = Makie.get_lights(mscene)
-    sun_sky_lights = [l for l in makie_lights if l isa Makie.SunSkyLight]
-    for l in sun_sky_lights
-        filter!(x -> x !== l, makie_lights)
-    end
-
     imsub = Scene(mscene)
     display_buffer = film.postprocess
     imgp = image!(imsub, -1 .. 1, -1 .. 1, Array(display_buffer), uv_transform=(:rotr90, :flip_y))
-
-    # Restore SunSkyLight after display
-    for l in sun_sky_lights
-        push!(makie_lights, l)
-    end
 
     # Restore volume visibility (they'll be hidden by the overlay image anyway)
     for p in volume_plots
@@ -1624,10 +1635,12 @@ function render_interactive(mscene::Makie.Scene; max_depth=5,
     cam_start = camera[]
     loki = Threads.ReentrantLock()
     cam_rendered = camera[]
-    running = Ref(true)
+    running = Threads.Atomic{Bool}(true)
 
     # Main render loop
-    Base.errormonitor(Threads.@spawn while running[] && !Makie.isclosed(mscene)
+    root = Makie.rootparent(mscene)
+    Base.errormonitor(Threads.@spawn while running[]
+        Makie.isclosed(root) && break
         # Poll for plot data updates (volume data, material changes, etc.)
         # This triggers the compute graph to apply any pending in-place updates
         if poll_updates!(state)
@@ -1646,7 +1659,6 @@ function render_interactive(mscene::Makie.Scene; max_depth=5,
                 imgp.visible = false
             end
         end
-
         # Render using screen's integrator
         @time screen.config.integrator(state.hikari_scene, film, camera[])
 
@@ -1659,23 +1671,23 @@ function render_interactive(mscene::Makie.Scene; max_depth=5,
             imgp[3] = Array(film.postprocess)
             imgp.visible = true
         end
-        sleep(1/30)
+        sleep(1/20)
     end)
 
     # Camera visibility thread
-    Base.errormonitor(Threads.@spawn while running[] && !Makie.isclosed(mscene)
+    Base.errormonitor(Threads.@spawn while running[] && !Makie.isclosed(root)
         lock(loki) do
             if cam_start != camera[]
                 cam_start = camera[]
                 imgp.visible = false
             end
         end
-        sleep(1/30)
+        sleep(1/20)
     end)
 
     # Return control handles
     return (
-        stop = () -> (running[] = false),
+        running = running,
         screen = screen,
     )
 end
