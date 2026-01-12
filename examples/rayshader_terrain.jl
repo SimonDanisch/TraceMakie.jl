@@ -1,13 +1,11 @@
 # Rayshader-style Terrain with Clouds Example
 # Demonstrates combining real elevation data (via Tyler) with BOMEX cloud data
 # Inspired by https://www.rayshader.com/
-
 using TraceMakie
 using Makie
 using Colors
 using GeometryBasics
 using LinearAlgebra: normalize, I
-using AMDGPU: ROCArray
 using Hikari: RGBSpectrum, compute_perez_coefficients, compute_zenith_values, _compute_sky_radiance
 
 using Tyler
@@ -17,6 +15,10 @@ using Extents: Extent
 
 using Oceananigans: FieldTimeSeries, interior
 using FileIO
+using AMDGPU: ROCArray
+using pocl_jll, OpenCL
+using Hikari
+
 
 # In-memory cache for fetched tile data
 const TILE_CACHE = Dict{String, Any}()
@@ -407,27 +409,6 @@ function generate_preetham_sky(
     return sky_data
 end
 
-# =============================================================================
-# Create the Rayshader Scene
-# =============================================================================
-
-"""
-    rayshader_scene(; lat=47.087441, lon=13.377214, delta=0.1,
-                     zoom=12, cloud_altitude_factor=1.5,
-                     sun_altitude=20.0, sun_azimuth=135.0,
-                     separate_sun_sky=true, figsize=(1024, 768))
-
-Create a rayshader-style 3D terrain with real elevation data and BOMEX clouds.
-
-# Arguments
-- `lat`, `lon`: Center coordinates (Austrian Alps by default)
-- `delta`: Extent size in degrees
-- `zoom`: Tile zoom level for elevation data
-- `cloud_altitude_factor`: How high above terrain to place clouds (as multiple of terrain height)
-- `sun_altitude`: Sun angle above horizon in degrees
-- `sun_azimuth`: Sun compass direction in degrees
-- `separate_sun_sky`: Use separated sun/sky lights for lower variance in volumetric rendering (default: true)
-"""
 function rayshader_scene(;
         lat=47.087441,
         lon=13.377214,
@@ -518,19 +499,19 @@ function rayshader_scene(;
     max_elev_norm = maximum(stitched_elev_norm)
 
     # # Plot the stitched surface
-    # if !isempty(stitched_color)
-    #     surface!(scene, (x_min_norm, x_max_norm), (y_min_norm, y_max_norm), stitched_elev_norm;
-    #         color=stitched_color,
-    #         shading=NoShading
-    #     )
-    # else
-    #     surface!(scene, (x_min_norm, x_max_norm), (y_min_norm, y_max_norm), stitched_elev_norm;
-    #         colormap=:terrain
-    #     )
-    # end
+    if !isempty(stitched_color)
+        surface!(scene, (x_min_norm, x_max_norm), (y_min_norm, y_max_norm), stitched_elev_norm;
+            color=stitched_color,
+            shading=NoShading
+        )
+    else
+        surface!(scene, (x_min_norm, x_max_norm), (y_min_norm, y_max_norm), stitched_elev_norm;
+            colormap=:terrain
+        )
+    end
 
-    # add_filled_sides!(scene, (x_min_norm, x_max_norm), (y_min_norm, y_max_norm),
-    #                     stitched_elev_norm, base_z_norm)
+    add_filled_sides!(scene, (x_min_norm, x_max_norm), (y_min_norm, y_max_norm),
+                        stitched_elev_norm, base_z_norm)
 
     # --- Add Cloud Volume ---
     cloud_base_norm = max_elev_norm + 0.1f0
@@ -542,8 +523,8 @@ function rayshader_scene(;
 
     volume!(scene, cloud_x, cloud_y, cloud_z, cloud_data;
         material=(;
-            extinction_scale=10000f0,
-            asymmetry_g=0.85f0,
+            extinction_scale=50000f0,  # Increased for more visible clouds
+            asymmetry_g=0.877f0,       # Disney cloud value for realistic forward scattering
             sun_direction=Vec3f(0.4, 0.5, 0.85),
             sun_intensity=25.0f0,
             max_depth=3
@@ -565,49 +546,25 @@ function rayshader_scene(;
     return scene, max_elev_norm, cloud_data
 end
 
-# =============================================================================
-# Render the Scene
-# =============================================================================
-
-"""
-    render_rayshader(; samples=16, max_depth=5, exposure=1.2, backend=ROCArray, save_path=nothing, kwargs...)
-
-Render a rayshader-style terrain with clouds using TraceMakie.
-
-# Arguments
-- `samples`: Number of samples per pixel (default: 16)
-- `max_depth`: Maximum ray bounce depth (default: 5)
-- `exposure`: Exposure multiplier (default: 1.0)
-- `tonemap`: Tonemapping method (default: :aces)
-- `gamma`: Gamma correction (default: 2.2)
-- `backend`: Array type for rendering (default: ROCArray for GPU)
-  - `ROCArray` - AMD GPU via AMDGPU.jl
-  - `CuArray` - NVIDIA GPU via CUDA.jl
-  - `Array` - CPU rendering
-- `save_path`: Optional path to save the rendered image
-- `separate_sun_sky`: Use separated sun/sky lights for lower variance (default: true)
-- `kwargs...`: Additional arguments passed to `rayshader_scene`
-
-Returns the rendered image (RGB matrix) and the Makie scene.
-"""
 function render_rayshader(;
-    samples=16,
-    max_depth=5,
-    exposure=1.0f0,
-    tonemap=:aces,
-    gamma=2.2f0,
-    backend=ROCArray,
-    save_path=nothing,
-    kwargs...
-)
+        samples=16,
+        max_depth=5,
+        exposure=1.0f0,
+        tonemap=:aces,
+        gamma=2.0f0,
+        backend=ROCArray,
+        save_path=nothing,
+        kwargs...
+    )
     println("Creating rayshader scene...")
     scene, elevation, clouds = rayshader_scene(; kwargs...)
 
     backend_name = nameof(backend)
     println("Rendering with TraceMakie on $backend_name ($(samples) spp, max_depth=$(max_depth))...")
 
-    integrator = TraceMakie.Whitted(samples=samples, max_depth=max_depth)
-    config = TraceMakie.ScreenConfig(integrator, exposure, tonemap, gamma, backend)
+    integrator = TraceMakie.VolPath(samples_per_pixel=samples, max_depth=max_depth)
+    sensor = Hikari.FilmSensor(iso=100, white_balance=6500)  # D65 daylight white balance
+    config = TraceMakie.ScreenConfig(integrator, exposure, tonemap, gamma, sensor, backend)
     screen = TraceMakie.Screen(scene, config)
 
     @time result = Makie.colorbuffer(screen)
@@ -617,7 +574,7 @@ function render_rayshader(;
         println("Saved to: $save_path")
     end
 
-    return result, scene
+    return result, scene, screen
 end
 
 using pocl_jll, OpenCL
@@ -627,7 +584,7 @@ using pocl_jll, OpenCL
 # =============================================================================
 
 # Austrian Alps location (Großglockner area)
-result, scene = render_rayshader(;
+result, scene, screen = render_rayshader(;
     lat=47.087441,
     lon=13.377214,
     delta=0.08,      # ~8km extent
@@ -635,11 +592,116 @@ result, scene = render_rayshader(;
     cloud_altitude_factor=1.2,
     sun_altitude=20.0,
     sun_azimuth=135.0,
-    samples=10,
-    max_depth=5,
+    samples=20,
+    max_depth=12,
     backend=Array,
-    exposure=1.2f0,
+    exposure=0.8f0,
     figsize=(1024, 768),
-    # save_path="rayshader_alps.png"
 )
 result
+
+# =============================================================================
+# Interactive Rayshader Rendering
+# =============================================================================
+
+"""
+    render_rayshader_interactive(; kwargs...)
+
+Launch an interactive ray-traced rayshader scene with progressive rendering.
+
+Uses `render_interactive` to continuously refine the image. The scene updates
+in real-time as you move the camera or adjust parameters.
+
+# Arguments
+Same as `render_rayshader`, plus:
+- `fps::Int=30`: Target frames per second for progressive updates
+"""
+function render_rayshader_interactive(;
+    lat=47.087441,
+    lon=13.377214,
+    delta=0.08,
+    zoom=13,
+    cloud_altitude_factor=1.2,
+    sun_altitude=20.0,
+    sun_azimuth=135.0,
+    max_depth=12,
+    backend=Array,
+    exposure=0.8f0,
+    tonemap=:aces,
+    gamma=2.2f0,
+    figsize=(1024, 768),
+)
+    # Create the scene
+    scene, elevation, clouds = rayshader_scene(;
+        lat, lon, delta, zoom,
+        cloud_altitude_factor,
+        sun_altitude, sun_azimuth
+    )
+    #
+    # scene.viewport[] = Makie.Rect2f(0, 0, figsize...)
+
+    # Create integrator for progressive rendering (1 sample per iteration)
+    integrator = TraceMakie.VolPath(samples_per_pixel=1, max_depth=max_depth)
+
+    # Create sensor with D65 daylight white balance
+    sensor = Hikari.FilmSensor(iso=100, white_balance=6500)
+
+    # Launch interactive render
+    handles = TraceMakie.render_interactive(
+        scene;
+        integrator=integrator,
+        exposure=exposure,
+        tonemap=tonemap,
+        gamma=gamma,
+        sensor=sensor,
+        backend=backend
+    )
+
+    println("Interactive rendering started!")
+    println("Move the camera to explore the scene")
+    println("The image will progressively refine when the camera is still")
+    println("To stop: handles.running[] = false")
+
+    return handles, scene
+end
+
+# Uncomment to test interactive rendering:
+handles, scene = render_rayshader_interactive(
+    lat=47.087441,
+    lon=13.377214,
+    delta=0.08,
+    zoom=13,
+    cloud_altitude_factor=1.2,
+    sun_altitude=20.0,
+    sun_azimuth=135.0,
+    max_depth=12,
+    backend=CLArray,
+    exposure=0.8f0,
+    figsize=(1024, 768),
+)
+using GLMakie
+display(scene; backend=GLMakie)
+# Hikari.postprocess!(screen.state.film;
+#     exposure=0.8f0,
+#     tonemap=:ace,
+#     gamma=2.2f0
+# )
+
+# save("clouds.png", result)
+
+# begin
+#     scene, elevation, clouds = rayshader_scene(lat=47.087441,
+#         lon=13.377214,
+#         delta=0.08,      # ~8km extent
+#         zoom=13,         # Good detail level
+#         cloud_altitude_factor=1.2,
+#         sun_altitude=20.0,
+#         sun_azimuth=135.0
+#     )
+
+#     integrator = TraceMakie.VolPath(samples_per_pixel=10, max_depth=10)
+#     config = TraceMakie.ScreenConfig(integrator, 1.0, :aces, 2.2f0, CLArray)
+#     screen = TraceMakie.Screen(scene, config)
+
+#     @time result = Makie.colorbuffer(screen)
+# end

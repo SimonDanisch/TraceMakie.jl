@@ -30,7 +30,7 @@ rotation_axes = Dict(
 function plot_part!(scene, parent, name::String)
     m = load(assetpath("lego_figure_" * name * ".stl"))
     color = colors[split(name, "_")[1]]
-    trans = Transformation(parent)
+    trans = Makie.Transformation(parent)
     ptrans = Makie.transformation(parent)
     origin = get(origins, name, nothing)
     if !isnothing(origin)
@@ -98,7 +98,7 @@ integrator_configs = [
 function create_scene()
     radiance = 15000f0
     lights = [
-        Makie.AmbientLight(RGBf(0.4, 0.4, 0.4)),
+        Makie.AmbientLight(RGBf(0.1, 0.1, 0.1)),
         Makie.PointLight(RGBf(radiance, radiance, radiance), Vec3f(150, 100, 200)),
     ]
     s = Scene(size=(800*2, 800); lights=lights)
@@ -110,23 +110,24 @@ function create_scene()
     return s, figure
 end
 
-# =============================================================================
-# Render with each integrator
-# =============================================================================
-images = map(integrator_configs[2:2]) do config
-    TraceMakie.activate!(; config...)
-    s, figure = create_scene()
-    name = nameof(typeof(config.integrator))
-    img = @time colorbuffer(s; backend=TraceMakie)
-    # println("Saving: lego_$(name).png")
-    # @time save("lego_$(name).png", img)
-end
-images[1]
+# Render with VolPath integrator
+volpath_config = (
+    backend = Array,
+    exposure = 0.8f0,
+    integrator = TraceMakie.VolPath(samples_per_pixel=20, max_depth=8),
+    tonemap = :aces,
+    sensor=Hikari.FilmSensor(iso=100, white_balance=6500),
+    gamma = 2.0f0,
+)
+TraceMakie.activate!(; volpath_config...)
+s, figure = create_scene();
+img = @time colorbuffer(s; backend=TraceMakie)
+
 # =============================================================================
 # Animation with each integrator
 # =============================================================================
 let
-    config = integrator_configs[2]
+    config = volpath_config
     TraceMakie.activate!(; config...)
     s, figure = create_scene()
     rot_joints_by = 0.25 * pi
@@ -137,7 +138,7 @@ let
     angles = [a1; reverse(a1[1:(end-1)]); -a1[2:end]; reverse(-a1[1:(end-1)])]
     nsteps = length(angles)
     translations = LinRange(0, total_translation, nsteps)
-    name = nameof(typeof(config.integrator))
+    name = "volpath"
     println("Recording: lego_$(name).mp4")
     @time Makie.record(s, "lego_$(name).mp4", zip(translations, angles); backend=TraceMakie) do (translation, angle)
         for name in ["arm_left", "arm_right", "leg_left", "leg_right"]

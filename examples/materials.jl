@@ -62,9 +62,8 @@ begin
     cam.lookat[] = Vec3f(0.5, 0, -0.5)
     cam.upvector[] = Vec3f(0, 0, 1)
     cam.fov[] = 35
-    TraceMakie.render_whitted(ax.scene; samples_per_pixel=8)
-    # @time colorbuffer(screen)
 end
+@time colorbuffer(ax.scene; backend=TraceMakie, integrator=Hikari.Whitted(samples=16, max_depth=5))
 
 # begin
 #     @time render_whitted(ax.scene)
