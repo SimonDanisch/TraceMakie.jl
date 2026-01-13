@@ -592,9 +592,9 @@ result, scene, screen = render_rayshader(;
     cloud_altitude_factor=1.2,
     sun_altitude=20.0,
     sun_azimuth=135.0,
-    samples=20,
+    samples=1,
     max_depth=12,
-    backend=Array,
+    backend=CLArray,
     exposure=0.8f0,
     figsize=(1024, 768),
 )

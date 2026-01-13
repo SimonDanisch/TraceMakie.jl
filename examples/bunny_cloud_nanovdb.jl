@@ -5,7 +5,7 @@
 using TraceMakie, Makie, Hikari, GeometryBasics, Raycore
 using FileIO, AMDGPU
 using Zlib_jll
-
+using pocl_jll, OpenCL
 # =============================================================================
 # NanoVDB Parser
 # =============================================================================
@@ -356,15 +356,18 @@ function create_nanovdb_bunny_scene(nvdb_path::String;
     sky_path = joinpath(dirname(nvdb_path), "textures", "sky.exr")
 
     # Load sky.exr and create Makie.EnvironmentLight
-    # Makie.EnvironmentLight expects (intensity, image::Matrix{RGBf})
+    # Makie.EnvironmentLight expects (intensity, image; rotation_angle, rotation_axis)
     sky_image = FileIO.load(sky_path)
     # Convert to Matrix{RGBf} and scale by 4.0 (pbrt's scale factor)
     sky_matrix = Matrix{RGBf}(map(c -> RGBf(c.r, c.g, c.b), sky_image))
-    env_light = Makie.EnvironmentLight(4.0f0, sky_matrix)
+    # Apply 10° rotation around X axis to match pbrt's "Rotate 10 1 0 0"
+    env_light = Makie.EnvironmentLight(4.0f0, sky_matrix;
+        rotation_angle=10f0, rotation_axis=Vec3f(1, 0, 0))
     push_light!(s, env_light)
     println("Loaded environment light from: $sky_path")
     return s
 end
+
 
 """
     render_nanovdb_bunny(nvdb_path; resolution=(800,600), spp=32, max_depth=50, kwargs...)
@@ -436,23 +439,23 @@ println("Rendering NanoVDB bunny cloud (matching pbrt-v4 settings)...")
 @time img, scene = render_nanovdb_bunny(
     nvdb_path;
     resolution=(800, 600),      # Lower res for testing (pbrt uses 1920x1080)
-    samples_per_pixel=10,
+    samples_per_pixel=20,
     max_depth=50,               # Matches pbrt
     downsample=2,
     # pbrt-matching parameters (now defaults):
     # sigma_s=10.0, sigma_a=0.5, g=0.0
     # iso=90, , fov=25,
-    white_balance=2000,
-    backend=ROCArray
+    white_balance=5000,
+    backend=CLArray
 )
 
 screen = Makie.getscreen(scene)
 
 Array(Hikari.postprocess!(screen.state.film;
-    exposure=0.8f0,
+    exposure=1f0,
     tonemap=nothing,
     gamma=2.2f0,
-    sensor=Hikari.FilmSensor(iso=100, white_balance=5000)
+    sensor=Hikari.FilmSensor(iso=100, white_balance=2700)
 ))
 
 # Save result

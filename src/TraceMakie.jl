@@ -1054,7 +1054,9 @@ function to_trace_light(light::Makie.EnvironmentLight)
     # Convert Makie's EnvironmentLight to Hikari's EnvironmentLight
     # Makie stores RGBf matrix, Hikari needs RGBSpectrum matrix
     data = map(c -> Hikari.RGBSpectrum(c.r, c.g, c.b), light.image)
-    env_map = Hikari.EnvironmentMap(data, 0f0)
+    # Build rotation matrix from axis-angle
+    rotation = Hikari.rotation_matrix(light.rotation_angle, light.rotation_axis)
+    env_map = Hikari.EnvironmentMap(data, rotation)
     return Hikari.EnvironmentLight(env_map, Hikari.RGBSpectrum(light.intensity))
 end
 
