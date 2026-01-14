@@ -1,77 +1,109 @@
+# Material showcase scene - demonstrates all available Hikari materials
+# Uses the new clean API without verbose ConstantTexture wrapping
+
 using GeometryBasics, Hikari
 using Colors, FileIO
-using Hikari
 using TraceMakie
 using GLMakie
 using ImageShow
-using Random
+
+# ============================================================================
+# Material Gallery Scene
+# ============================================================================
+
 begin
+    # Setup lighting
     radiance = 50
     lights = [
         PointLight(RGBf(radiance, radiance, radiance), Vec3f(10)),
-        PointLight(RGBf(10, 10, 10), Vec3f(-0.3, -5.5, 0.9)),
+        PointLight(RGBf(15, 15, 15), Vec3f(-0.3, -5.5, 1.5)),
     ]
-    fig = Figure(; size=(1024, 1024))
-    ax = LScene(fig[1, 1]; show_axis=false, scenekw=(lights=lights,))
 
-    emissive = Hikari.MatteMaterial(
-        Hikari.ConstantTexture(Hikari.RGBSpectrum(0.4f0, 0.6f0, 0.2f0)),
-        Hikari.ConstantTexture(1.0f0),
-    )
-    diffuse = Hikari.MatteMaterial(
-        Hikari.ConstantTexture(Hikari.RGBSpectrum(0.796f0, 0.235f0, 0.2f0)),
-        Hikari.ConstantTexture(0.0f0),
-    )
-    glass = Hikari.GlassMaterial(
-        Hikari.ConstantTexture(Hikari.RGBSpectrum(1.0f0)),
-        Hikari.ConstantTexture(Hikari.RGBSpectrum(1.0f0)),
-        Hikari.ConstantTexture(0.0f0),
-        Hikari.ConstantTexture(0.0f0),
-        Hikari.ConstantTexture(1.5f0),
-        true,
-    )
-    plastic = Hikari.PlasticMaterial(
-        Hikari.ConstantTexture(Hikari.RGBSpectrum(0.6399999857f0, 0.6399999857f0, 0.6399999857f0)),
-        Hikari.ConstantTexture(Hikari.RGBSpectrum(0.1000000015f0, 0.1000000015f0, 0.1000000015f0)),
-        Hikari.ConstantTexture(0.010408001f0),
-        true,
-    )
-    chrome = Hikari.MirrorMaterial(Hikari.ConstantTexture(Hikari.RGBSpectrum(1.0f0)))
-    dielectric = Hikari.MirrorMaterial(Hikari.ConstantTexture(Hikari.RGBSpectrum(1.0f0, 0f0, 0f0)))
-    gold = Hikari.MirrorMaterial(Hikari.ConstantTexture(Hikari.RGBSpectrum(1.0f0, 1.0f0, 0.0f0)))
+    ax = Scene(; size=(1200, 900), lights=lights)
+    cam3d!(ax)
+    # ========================================================================
+    # Define materials using the clean API
+    # ========================================================================
 
-    materials = shuffle!([glass chrome;
-        gold dielectric;
-        emissive plastic])
+    # Row 1: Basic materials
+    diffuse_red = Hikari.Diffuse(Kd=(0.8, 0.2, 0.2))
+    diffuse_green = Hikari.Diffuse(Kd=(0.2, 0.8, 0.3), σ=30)  # Oren-Nayar roughness
+    mirror = Hikari.Mirror(Kr=(0.95, 0.95, 0.95))
+    glass = Hikari.Dielectric(Kt=(1, 1, 1), index=1.5)
 
+    # Row 2: Metals using preset constructors
+    gold = Hikari.Gold(roughness=0.05)
+    silver = Hikari.Silver(roughness=0.02)
+    copper = Hikari.Copper(roughness=0.1)
+    aluminum = Hikari.Aluminum(roughness=0.15)
+
+    # Row 3: Plastic and coated diffuse materials
+    plastic_blue = Hikari.Plastic(Kd=(0.1, 0.2, 0.8), Ks=(0.5, 0.5, 0.5), roughness=0.05)
+    plastic_white = Hikari.Plastic(Kd=(0.9, 0.9, 0.9), Ks=(0.3, 0.3, 0.3), roughness=0.2)
+    coated_red = Hikari.CoatedDiffuse(reflectance=(0.8, 0.2, 0.2), roughness=0.1)
+    coated_green = Hikari.CoatedDiffuse(reflectance=(0.2, 0.7, 0.3), roughness=0.0)
+
+    # Row 4: New materials - ThinDielectric, DiffuseTransmission, CoatedConductor
+    thin_glass = Hikari.ThinDielectric(eta=1.5)  # Window glass
+    paper = Hikari.DiffuseTransmission(  # Paper/cloth
+        reflectance=(0.8, 0.8, 0.8),
+        transmittance=(0.5, 0.5, 0.5)
+    )
+    coated_gold = Hikari.CoatedConductor(  # Lacquered gold
+        interface_roughness=0.05,
+        conductor_eta=(0.143, 0.374, 1.442),  # Gold
+        conductor_k=(3.983, 2.385, 1.603),
+        conductor_roughness=0.02
+    )
+    car_paint = Hikari.CoatedConductor(  # Red metallic car paint
+        interface_roughness=0.1,
+        reflectance=(0.9, 0.1, 0.1),  # Red metallic
+        conductor_roughness=0.01
+    )
+
+    # Arrange in grid (4 rows x 4 columns)
+    materials = [
+        diffuse_red    diffuse_green  mirror         glass;
+        gold           silver         copper         aluminum;
+        plastic_blue   plastic_white  coated_red     coated_green;
+        thin_glass     paper          coated_gold    car_paint
+    ]
+
+    labels = [
+        "Diffuse"      "Diffuse+σ"    "Mirror"       "Glass";
+        "Gold"         "Silver"       "Copper"       "Aluminum";
+        "Plastic"      "Plastic"      "CoatedDiff"   "CoatedDiff";
+        "ThinGlass"    "Paper"        "CoatedGold"   "CarPaint"
+    ]
+
+    # Load floor
     floor = load(Makie.assetpath("matball_floor.obj"))
     mesh!(ax, floor.mesh; color=:white)
 
-    palette = reshape(Makie.DEFAULT_PALETTES.color[][1:6], size(materials))
+    # Place spheres in grid
+    sphere_radius = 0.25f0
+    spacing = 0.7f0
 
+    nrows, ncols = size(materials)
     for i in CartesianIndices(materials)
-        x, y = Tuple(i)
+        row, col = Tuple(i)
         mat = materials[i]
-        v = Vec3f(((x, y) .- (0.3 .* size(materials)) .- 0.3)..., 0)
-        offset = 0.9 .* (v .- Vec3f(0, 5, 0))
-        mesh!(ax.scene, Sphere(Point3f(offset) .+ Point3f(0, 0, 0.3), 0.3f0), material=mat)
-        # translate!(mplot, 0.9 .* (v .- Vec3f(0, 3, 0)))
-    end
-    cam = cameracontrols(ax.scene)
-    cam.eyeposition[] = Vec3f(-0.3, -6.5, 0.9)
-    cam.lookat[] = Vec3f(0.5, 0, -0.5)
-    cam.upvector[] = Vec3f(0, 0, 1)
-    cam.fov[] = 35
-end
-@time colorbuffer(ax.scene; backend=TraceMakie, integrator=Hikari.Whitted(samples=16, max_depth=5))
 
-# begin
-#     @time render_whitted(ax.scene)
-# end
-begin
-    scene, cam, film = TraceMakie.convert_scene(ax.scene)
-    Hikari.clear!(film)
-    integrator = Hikari.WhittedIntegrator(cam[], Hikari.UniformSampler(8), 8)
-    @time integrator(scene, film, cam[])
-    film.framebuffer
+        # Center the grid
+        x = (col - (ncols + 1) / 2) * spacing
+        y = (row - (nrows + 1) / 2) * spacing - 4.5  # Offset towards camera
+
+        pos = Point3f(x, y, sphere_radius)
+        mesh!(ax, Sphere(pos, sphere_radius), material=mat)
+    end
+
+    # Camera setup
+    cam = cameracontrols(ax)
+    cam.eyeposition[] = Vec3f(0, -7, 2)
+    cam.lookat[] = Vec3f(0, -3, 0)
+    cam.upvector[] = Vec3f(0, 0, 1)
+    cam.fov[] = 40
 end
+
+# Render with VolPath integrator
+@time colorbuffer(ax; backend=TraceMakie, integrator=Hikari.VolPath(samples=32, max_depth=8))

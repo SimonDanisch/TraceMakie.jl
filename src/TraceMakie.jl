@@ -678,6 +678,24 @@ function merge_color_with_material(color_tex::Hikari.Texture, material::Hikari.C
     )
 end
 
+function merge_color_with_material(color_tex::Hikari.Texture, material::Hikari.ThinDielectricMaterial)
+    # ThinDielectric is colorless (just IOR), return as-is
+    material
+end
+
+function merge_color_with_material(color_tex::Hikari.Texture, material::Hikari.DiffuseTransmissionMaterial)
+    # For diffuse transmission, color replaces the reflectance
+    Hikari.DiffuseTransmissionMaterial(
+        color_tex, material.transmittance, material.scale
+    )
+end
+
+function merge_color_with_material(color_tex::Hikari.Texture, material::Hikari.CoatedConductorMaterial)
+    # CoatedConductor is physically based - merging color doesn't make sense
+    # Return as-is (similar to ThinDielectric)
+    material
+end
+
 # Fallback for unknown material types - just return the material as-is
 function merge_color_with_material(color_tex::Hikari.Texture, material::Hikari.Material)
     @warn "Unknown material type $(typeof(material)), ignoring color"
