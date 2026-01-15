@@ -3,7 +3,7 @@
 #
 # This parses the NanoVDB file format directly in Julia and renders with GridMedium + VolPath
 using TraceMakie, Makie, Hikari, GeometryBasics, Raycore
-using FileIO, AMDGPU
+using FileIO
 using Zlib_jll
 using pocl_jll, OpenCL
 # =============================================================================
@@ -246,21 +246,6 @@ function create_nanovdb_bunny_scene(nvdb_path::String;
     volume_ds = downsample_volume(volume, downsample)
     println("Downsampled to: $(size(volume_ds))")
 
-    # pbrt applies these rotations to the medium:
-    # Rotate 180 0 0 1  (180° around Z axis)
-    # Rotate 90 1 0 0   (90° around X axis)
-    # This effectively: flips X (from 180° Z), then rotates Y->Z, Z->-Y (from 90° X)
-    # Combined: (x,y,z) -> (-x, -z, y)
-
-    # Apply the rotation by permuting and flipping the volume axes
-    # Original NanoVDB is Y-up. After pbrt rotations:
-    # - 180° around Z: (x,y,z) -> (-x,-y,z)
-    # - 90° around X: (x,y,z) -> (x,z,-y)
-    # Combined: (x,y,z) -> (-x, z, -(-y)) = (-x, z, y)
-    # But since we flip axes, we need to reverse those dimensions
-
-    # Actually, let's just match the visual orientation:
-    # The bunny should be upright with Z as up in the final scene
     # NanoVDB stores Y-up bunny, so swap Y<->Z
     volume_reoriented = permutedims(volume_ds, (1, 3, 2))
     # Flip X to match the 180° Z rotation (bunny facing correct direction)
@@ -294,7 +279,7 @@ function create_nanovdb_bunny_scene(nvdb_path::String;
         g = g,
         bounds = bounds
     )
-
+    @show bounds
     # Create scene (no default lights - we'll add environment light)
     s = Scene(size=resolution; lights=Makie.AbstractLight[])
     cam3d!(s)
@@ -318,8 +303,9 @@ function create_nanovdb_bunny_scene(nvdb_path::String;
     )
 
     # Create sphere geometry for medium boundary (pbrt uses sphere radius 45)
-    # The sphere is centered at origin in pbrt
-    sphere_mesh = GeometryBasics.normal_mesh(GeometryBasics.Sphere(Point3f(0, 0, 17), 45f0))
+    # The sphere is centered at origin in pbrt (0, 0, 0)
+    # With radius 45, bottom of sphere is at Z = -45, close to ground at Z = -50
+    sphere_mesh = GeometryBasics.normal_mesh(GeometryBasics.Sphere(Point3f(0, 0, 0), 45f0))
 
     # Volume sphere with medium interface
     volume_material = Hikari.MediumInterface(transparent; inside=grid_medium, outside=nothing)
@@ -330,15 +316,20 @@ function create_nanovdb_bunny_scene(nvdb_path::String;
     # Material "coateddiffuse" "rgb reflectance" [ .4 .45 .35 ] "float roughness" 0
     # Shape "disk" "float radius" 1000
     #
-    # In pbrt's coordinate system with Z-up: Translate 0 -50 0 moves in -Y direction
-    # The disk is perpendicular to Y axis at y=-50
+    # pbrt disk default orientation: lies in XY plane with normal pointing +Z
+    # After Translate 0 -50 0: disk center moves to (0, -50, 0)
+    # But the disk is still HORIZONTAL (normal +Z) - it's a ground plane!
+    # Since Z is up in this scene, the ground should be at Z = -50 (UNDER the bunny)
+    # Note: pbrt's "Translate 0 -50 0" in Y doesn't change Z position of disk surface
 
-    # Create a large flat quad for the ground at y=-50
-    # (disk would be better but quad is simpler and equivalent for large radius)
+    # Create a large flat box for the ground at Z=0 (horizontal, Z is up)
+    # pbrt disk is at Z=0 (Translate 0 -50 0 only moves in Y, not Z)
+    # The sphere (radius 45 at origin) intersects the ground - this is intentional!
+    # The bunny cloud density is mostly above Z=0, so ground cuts through lower sphere
     ground_size = 1000f0
-    ground_y = -50f0
-    ground_geo = Rect3f(Vec3f(-ground_size, ground_y - 0.1f0, -ground_size),
-                        Vec3f(2*ground_size, 0.2f0, 2*ground_size))
+    ground_z = 0f0  # Z position (ground plane at Z=0, sphere intersects it)
+    ground_geo = Rect3f(Vec3f(-ground_size, -ground_size, ground_z - 0.1f0),
+                        Vec3f(2*ground_size, 2*ground_size, 0.2f0))
 
     # CoatedDiffuseMaterial - exact pbrt-v4 port with LayeredBxDF
     # "coateddiffuse" "rgb reflectance" [ .4 .45 .35 ] "float roughness" 0
@@ -406,7 +397,7 @@ function render_nanovdb_bunny(nvdb_path::String;
     volpath_config = (
         backend = backend,
         integrator = TraceMakie.VolPath(
-            samples_per_pixel=samples_per_pixel,
+            samples=samples_per_pixel,
             max_depth=max_depth
         ),
         exposure = exposure,
@@ -422,13 +413,16 @@ function render_nanovdb_bunny(nvdb_path::String;
 
     return img, scene
 end
+nvdb_path = joinpath(@__DIR__, "..", "..", "..", "pbrt-v4-scenes", "bunny-cloud", "bunny_cloud.nvdb")
+
+# scene = create_nanovdb_bunny_scene(nvdb_path);
+# display(scene; backend=GLMakie)
 
 # =============================================================================
 # Example Usage - Matching pbrt-v4 bunny-cloud.pbrt
 # =============================================================================
 
 # Path to NanoVDB file
-nvdb_path = joinpath(@__DIR__, "..", "..", "..", "pbrt-v4-scenes", "bunny-cloud", "bunny_cloud.nvdb")
 
 if !isfile(nvdb_path)
     error("NanoVDB file not found at: $nvdb_path\n" *
@@ -439,7 +433,7 @@ println("Rendering NanoVDB bunny cloud (matching pbrt-v4 settings)...")
 @time img, scene = render_nanovdb_bunny(
     nvdb_path;
     resolution=(800, 600),      # Lower res for testing (pbrt uses 1920x1080)
-    samples_per_pixel=20,
+    samples_per_pixel=100,
     max_depth=50,               # Matches pbrt
     downsample=2,
     # pbrt-matching parameters (now defaults):
@@ -448,6 +442,7 @@ println("Rendering NanoVDB bunny cloud (matching pbrt-v4 settings)...")
     white_balance=5000,
     backend=CLArray
 )
+img
 
 screen = Makie.getscreen(scene)
 
@@ -455,10 +450,11 @@ Array(Hikari.postprocess!(screen.state.film;
     exposure=1f0,
     tonemap=nothing,
     gamma=2.2f0,
-    sensor=Hikari.FilmSensor(iso=100, white_balance=2700)
+    sensor=Hikari.FilmSensor(iso=20, white_balance=4000)
 ))
 
 # Save result
 # output_path = joinpath(@__DIR__, "bunny_cloud_nanovdb.png")
 save(output_path, img)
 println("Saved to: $output_path")
+1

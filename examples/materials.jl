@@ -6,6 +6,8 @@ using Colors, FileIO
 using TraceMakie
 using GLMakie
 using ImageShow
+using AMDGPU
+using pocl_jll, OpenCL
 
 # ============================================================================
 # Material Gallery Scene
@@ -106,4 +108,10 @@ begin
 end
 
 # Render with VolPath integrator
-@time colorbuffer(ax; backend=TraceMakie, integrator=Hikari.VolPath(samples=32, max_depth=8))
+TraceMakie.activate!(backend=CLArray)
+integrator = Hikari.VolPath(samples=32, regularize=true, max_depth=8, material_coherence=:none)
+img = @time "per material" colorbuffer(ax; backend=TraceMakie, integrator=integrator)
+screen = Makie.getscreen(ax)
+img = @time "per material" colorbuffer(screen)
+
+img2 = @time "normal" colorbuffer(ax; backend=TraceMakie, integrator=Hikari.VolPath(samples=32, regularize=true, max_depth=8))
