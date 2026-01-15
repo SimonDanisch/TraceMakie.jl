@@ -1,12 +1,8 @@
-# Material showcase scene - demonstrates all available Hikari materials
-# Uses the new clean API without verbose ConstantTexture wrapping
-
 using GeometryBasics, Hikari
 using Colors, FileIO
 using TraceMakie
 using GLMakie
 using ImageShow
-using AMDGPU
 using pocl_jll, OpenCL
 
 # ============================================================================
@@ -106,10 +102,9 @@ begin
     cam.upvector[] = Vec3f(0, 0, 1)
     cam.fov[] = 40
 end
-
 # Render with VolPath integrator
 TraceMakie.activate!(backend=CLArray)
-integrator = Hikari.VolPath(samples=32, regularize=true, max_depth=8, material_coherence=:none)
+integrator = Hikari.VolPath(samples=1, regularize=true, max_depth=8, material_coherence=:none)
 img = @time "per material" colorbuffer(ax; backend=TraceMakie, integrator=integrator)
 screen = Makie.getscreen(ax)
 img = @time "per material" colorbuffer(screen)

@@ -433,7 +433,7 @@ println("Rendering NanoVDB bunny cloud (matching pbrt-v4 settings)...")
 @time img, scene = render_nanovdb_bunny(
     nvdb_path;
     resolution=(800, 600),      # Lower res for testing (pbrt uses 1920x1080)
-    samples_per_pixel=100,
+    samples_per_pixel=50,
     max_depth=50,               # Matches pbrt
     downsample=2,
     # pbrt-matching parameters (now defaults):
@@ -446,15 +446,26 @@ img
 
 screen = Makie.getscreen(scene)
 
-Array(Hikari.postprocess!(screen.state.film;
+img2 = Array(Hikari.postprocess!(screen.state.film;
     exposure=1f0,
     tonemap=nothing,
     gamma=2.2f0,
-    sensor=Hikari.FilmSensor(iso=20, white_balance=4000)
+    sensor=Hikari.FilmSensor(iso=50, white_balance=3000)
 ))
-
+for i in 1:20
+    state = screen.state
+    @time Hikari.render!(screen.config.integrator, state.hikari_scene, state.film, state.camera[])
+    # Apply postprocessing with current observable values
+    img2 = Array(Hikari.postprocess!(screen.state.film;
+        exposure=1f0,
+        tonemap=:aces,
+        gamma=2.2f0,
+        sensor=Hikari.FilmSensor(iso=50, white_balance=3000)
+    ))
+    display(img2)
+end
 # Save result
-# output_path = joinpath(@__DIR__, "bunny_cloud_nanovdb.png")
-save(output_path, img)
+output_path = joinpath(@__DIR__, "bunny_cloud_high.png")
+save(output_path, img2)
 println("Saved to: $output_path")
 1
