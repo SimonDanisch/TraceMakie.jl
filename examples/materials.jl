@@ -13,8 +13,8 @@ begin
     # Setup lighting
     radiance = 50
     lights = [
-        PointLight(RGBf(radiance, radiance, radiance), Vec3f(10)),
-        PointLight(RGBf(15, 15, 15), Vec3f(-0.3, -5.5, 1.5)),
+        Makie.PointLight(RGBf(radiance, radiance, radiance), Vec3f(10)),
+        Makie.PointLight(RGBf(15, 15, 15), Vec3f(-0.3, -5.5, 1.5)),
     ]
 
     ax = Scene(; size=(1200, 900), lights=lights)
@@ -104,9 +104,7 @@ begin
 end
 # Render with VolPath integrator
 TraceMakie.activate!(backend=CLArray)
-integrator = Hikari.VolPath(samples=1, regularize=true, max_depth=8, material_coherence=:none)
-img = @time "per material" colorbuffer(ax; backend=TraceMakie, integrator=integrator)
+integrator = Hikari.VolPath(samples=32, regularize=true, max_depth=8, material_coherence=:none)
+img = @time "first render" colorbuffer(ax; backend=TraceMakie, integrator=integrator)
 screen = Makie.getscreen(ax)
-img = @time "per material" colorbuffer(screen)
-
-img2 = @time "normal" colorbuffer(ax; backend=TraceMakie, integrator=Hikari.VolPath(samples=32, regularize=true, max_depth=8))
+img = @time "without compilation" colorbuffer(screen)
