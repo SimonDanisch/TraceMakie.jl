@@ -8,8 +8,7 @@ spp = 4
 
 # Load the sky.exr from bunny-cloud scene
 sky_path = joinpath(@__DIR__, "..", "..", "..", "pbrt-v4-scenes", "bunny-cloud", "textures", "sky.exr")
-sky_image = FileIO.load(sky_path)
-sky_matrix = Matrix{RGBf}(map(c -> RGBf(c.r, c.g, c.b), sky_image))
+sky_matrix = FileIO.load(sky_path)
 
 # Perfect mirror material
 mirror = Hikari.ConductorMaterial(

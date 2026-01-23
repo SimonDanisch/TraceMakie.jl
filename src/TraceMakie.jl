@@ -44,6 +44,11 @@ Configuration for TraceMakie rendering.
   - `Array` - CPU rendering
   - `ROCArray` - AMD GPU via AMDGPU.jl
   - `CuArray` - NVIDIA GPU via CUDA.jl
+* `denoise`: Enable à-trous wavelet denoising (default: false)
+  - Requires auxiliary buffers (normals, depth) to be filled
+  - Significantly reduces noise at low sample counts
+* `denoise_config`: Configuration for the denoiser (default: sensible defaults)
+  - `Hikari.DenoiseConfig(iterations=5, sigma_color=4.0, sigma_normal=128.0, sigma_depth=1.0)`
 """
 struct ScreenConfig
     integrator::Hikari.Integrator
@@ -52,12 +57,14 @@ struct ScreenConfig
     gamma::Union{Float32, Nothing}
     sensor::Union{Hikari.FilmSensor, Nothing}
     backend::Type  # Array type: Array for CPU, ROCArray/CuArray for GPU
+    denoise::Bool
+    denoise_config::Union{Hikari.DenoiseConfig, Nothing}
 
-    function ScreenConfig(integrator, exposure, tonemap, gamma, sensor, backend=Array)
+    function ScreenConfig(integrator, exposure, tonemap, gamma, sensor, backend=Array, denoise=false, denoise_config=nothing)
         actual_integrator = integrator isa Makie.Automatic ? Whitted() : integrator
         actual_exposure = Float32(exposure)
         actual_gamma = isnothing(gamma) ? nothing : Float32(gamma)
-        return new(actual_integrator, actual_exposure, tonemap, actual_gamma, sensor, backend)
+        return new(actual_integrator, actual_exposure, tonemap, actual_gamma, sensor, backend, denoise, denoise_config)
     end
 end
 
@@ -278,7 +285,6 @@ end
 
 # Helper to extract mutable texture from material (for in-place color updates)
 _get_material_texture(mat::Hikari.MatteMaterial) = mat.Kd isa Hikari.Texture ? mat.Kd : nothing
-_get_material_texture(mat::Hikari.PlasticMaterial) = mat.Kd isa Hikari.Texture ? mat.Kd : nothing
 _get_material_texture(mat::Hikari.MetalMaterial) = mat.reflectance isa Hikari.Texture ? mat.reflectance : nothing
 _get_material_texture(mat::Hikari.Material) = nothing
 
@@ -357,8 +363,54 @@ function Base.show(io::IO, ::MIME"text/plain", screen::Screen)
     print(io, "  Exposure: ", screen.config.exposure)
 end
 
-Base.isopen(::Screen) = true
 Base.size(screen::Screen) = isnothing(screen.scene) ? (0, 0) : size(screen.scene)
+
+# Track whether screen is open for resource management
+const _open_screens = Set{UInt}()
+
+function Base.isopen(screen::Screen)
+    return objectid(screen) in _open_screens || screen.state !== nothing
+end
+
+"""
+    cleanup!(state::TraceMakieState)
+
+Release GPU memory held by TraceMakieState.
+"""
+function cleanup!(state::TraceMakieState)
+    # Cleanup film
+    Hikari.cleanup!(state.film)
+
+    # Finalize all preserved GPU arrays
+    for arr in state.preserve
+        finalize(arr)
+    end
+    empty!(state.preserve)
+
+    return nothing
+end
+
+"""
+    Base.close(screen::Screen)
+
+Release all GPU resources held by the screen, including the integrator state,
+film, and preserved GPU arrays. Call this when done rendering to free GPU memory.
+"""
+function Base.close(screen::Screen)
+    # Cleanup TraceMakieState if present
+    if screen.state !== nothing
+        cleanup!(screen.state)
+        screen.state = nothing
+    end
+
+    # Cleanup integrator's cached state
+    close(screen.config.integrator)
+
+    # Remove from open screens tracking
+    delete!(_open_screens, objectid(screen))
+
+    return nothing
+end
 
 function Screen(fb_size::NTuple{2, <:Integer}; screen_config...)
     config = Makie.merge_screen_config(ScreenConfig, Dict{Symbol, Any}(screen_config))
@@ -419,8 +471,13 @@ function render!(screen::Screen)
     # Clear film and render (scene/film are already CPU or GPU based on backend)
     Hikari.clear!(state.film)
     camera = state.camera[]
-    screen.config.integrator(state.hikari_scene, state.film, camera)
 
+    # Fill auxiliary buffers if denoising is enabled (before main render)
+    if screen.config.denoise
+        Hikari.fill_aux_buffers!(state.film, state.hikari_scene, camera)
+    end
+
+    screen.config.integrator(state.hikari_scene, state.film, camera)
     return state.film
 end
 
@@ -433,8 +490,28 @@ function Makie.colorbuffer(screen::Screen, format::Makie.ImageStorageFormat = Ma
 
     render!(screen)
 
-    # Apply postprocessing on GPU/CPU (tonemapping, gamma, exposure, sensor)
+    # Convert pixel samples to framebuffer (needed before denoising)
+    # Note: VolPath integrator writes directly to framebuffer in its finalize kernel,
+    # so we only call to_framebuffer! for other integrators (like Whitted) that use tiles
+    if !(screen.config.integrator isa Hikari.VolPath)
+        Hikari.to_framebuffer!(screen.state.film)
+    end
+
+    # Apply denoising if enabled (before postprocessing)
     config = screen.config
+    if config.denoise
+        denoise_cfg = something(config.denoise_config, Hikari.DenoiseConfig())
+        Hikari.denoise!(screen.state.film; config=denoise_cfg)
+    end
+
+    # Apply postprocessing on GPU/CPU (tonemapping, gamma, exposure, sensor)
+    # Note: when denoising is enabled, postprocess! reads from postprocess buffer (denoised)
+    # When denoising is disabled, postprocess! reads from framebuffer (raw)
+    if config.denoise
+        # Denoised result is in postprocess buffer, copy back to framebuffer for postprocess!
+        copyto!(screen.state.film.framebuffer, screen.state.film.postprocess)
+    end
+
     Hikari.postprocess!(screen.state.film;
         exposure = config.exposure,
         tonemap = config.tonemap,
@@ -658,10 +735,6 @@ function merge_color_with_material(color_tex::Hikari.Texture, material::Hikari.G
         material.u_roughness, material.v_roughness,
         material.index, material.remap_roughness
     )
-end
-
-function merge_color_with_material(color_tex::Hikari.Texture, material::Hikari.PlasticMaterial)
-    Hikari.PlasticMaterial(color_tex, material.Ks, material.roughness, material.remap_roughness)
 end
 
 function merge_color_with_material(color_tex::Hikari.Texture, material::Hikari.MetalMaterial)
@@ -968,33 +1041,97 @@ function to_trace_primitive(plot::Makie.Volume, integrator::Hikari.Integrator=Wh
         end
     end
 
+    # Get colormap and colorrange from plot attributes
+    colormap_attr = to_value(plot.colormap)
+    colorrange_attr = to_value(plot.colorrange)
+
     # Create bounding box mesh for the volume
     cloud_box_geo = Rect3f(origin, extent)
     cloud_box_mesh = Raycore.TriangleMesh(normal_mesh(cloud_box_geo))
 
     # Create appropriate material based on integrator type
     if integrator isa Hikari.VolPath
-        # For VolPath: use GridMedium with MediumInterface
-        # Scale density by extinction_scale (density array becomes extinction coefficients)
-        scaled_density = density .* extinction_scale
-
-        # Compute σ_a and σ_s from single_scatter_albedo
-        # albedo = σ_s / (σ_a + σ_s), so σ_a = σ_s * (1 - albedo) / albedo
-        # For clouds, albedo ≈ 1.0, so σ_a ≈ 0
-        # We use σ_s = 1 as a multiplier (density already contains extinction)
-        σ_a_factor = (1f0 - single_scatter_albedo) / max(single_scatter_albedo, 1f-6)
-        σ_a = Hikari.RGBSpectrum(σ_a_factor, σ_a_factor, σ_a_factor)
-        σ_s = Hikari.RGBSpectrum(1f0, 1f0, 1f0)
-
-        # Create GridMedium
         bounds = Raycore.Bounds3(origin, origin + extent)
-        grid_medium = Hikari.GridMedium(
-            scaled_density;
-            σ_a = σ_a,
-            σ_s = σ_s,
-            g = asymmetry_g,
-            bounds = bounds
-        )
+        majorant_res = Vec{3, Int64}(16, 16, 16)
+
+        # Check if we should use colormap (RGBGridMedium) or grayscale (GridMedium)
+        # Use RGBGridMedium when colormap is explicitly set to something other than default
+        use_colormap = !isnothing(colormap_attr)
+
+        if use_colormap
+            # Convert colormap to array of colors
+            cmap = Makie.to_colormap(colormap_attr)
+
+            # Determine colorrange (normalize density to [0,1] for colormap lookup)
+            if isnothing(colorrange_attr) || colorrange_attr isa Makie.Automatic
+                cmin, cmax = extrema(density)
+            else
+                cmin, cmax = Float32(colorrange_attr[1]), Float32(colorrange_attr[2])
+            end
+            crange = cmax - cmin
+            if crange < 1f-10
+                crange = 1f0
+            end
+
+            # Build per-voxel σ_s grid from colormap
+            # Density controls scattering magnitude, colormap controls color
+            # Alpha from colormap further modulates visibility (transparent = less scattering)
+            nx, ny, nz = size(density)
+            σ_s_grid = Array{Hikari.RGBSpectrum, 3}(undef, nx, ny, nz)
+            # Zero absorption grid (pure scattering medium)
+            σ_a_grid = fill(Hikari.RGBSpectrum(0f0), nx, ny, nz)
+
+            for iz in 1:nz, iy in 1:ny, ix in 1:nx
+                d = density[ix, iy, iz]
+                # Normalize density to [0,1] for colormap lookup
+                t = clamp((d - cmin) / crange, 0f0, 1f0)
+                # Sample colormap (RGBA)
+                color = Makie.interpolated_getindex(cmap, t)
+                # Density provides scattering magnitude, color provides wavelength dependence
+                # Alpha modulates overall visibility (transparent regions scatter less)
+                # If colormap is black, use white (grayscale) scattering at that density
+                r, g, b = Float32(color.r), Float32(color.g), Float32(color.b)
+                color_max = max(r, g, b)
+                if color_max < 1f-6
+                    # Black in colormap = use neutral gray scattering at this density
+                    r, g, b = 1f0, 1f0, 1f0
+                else
+                    # Normalize color to preserve hue but let density control magnitude
+                    r, g, b = r / color_max, g / color_max, b / color_max
+                end
+                # Scale by density and alpha
+                scale = d * Float32(color.alpha)
+                σ_s_grid[ix, iy, iz] = Hikari.RGBSpectrum(r * scale, g * scale, b * scale)
+            end
+
+            # Create RGBGridMedium with per-voxel colors
+            # Provide explicit zero σ_a grid (pbrt-v4 defaults absent grids to 1.0)
+            grid_medium = Hikari.RGBGridMedium(
+                σ_a_grid = σ_a_grid,
+                σ_s_grid = σ_s_grid,
+                sigma_scale = extinction_scale,
+                g = asymmetry_g,
+                bounds = bounds,
+                majorant_res = majorant_res
+            )
+        else
+            # No colormap: use original GridMedium with uniform white scattering
+            scaled_density = density .* extinction_scale
+
+            # Compute σ_a and σ_s from single_scatter_albedo
+            σ_a_factor = (1f0 - single_scatter_albedo) / max(single_scatter_albedo, 1f-6)
+            σ_a = Hikari.RGBSpectrum(σ_a_factor, σ_a_factor, σ_a_factor)
+            σ_s = Hikari.RGBSpectrum(1f0, 1f0, 1f0)
+
+            grid_medium = Hikari.GridMedium(
+                scaled_density;
+                σ_a = σ_a,
+                σ_s = σ_s,
+                g = asymmetry_g,
+                bounds = bounds,
+                majorant_res = majorant_res
+            )
+        end
 
         # Wrap in MediumInterface with transparent boundary
         transparent = Hikari.GlassMaterial(
@@ -1037,9 +1174,44 @@ function to_trace_light(light::Makie.AmbientLight)
 end
 
 function to_trace_light(light::Makie.PointLight)
-    return Hikari.PointLight(
-        Vec3f(light.position), to_spectrum(light.color),
-    )
+    # Convert color to RGB values
+    rgb = RGBf(light.color)
+
+    # Separate intensity from color:
+    # - intensity = max(r, g, b) - this is the radiance scale
+    # - color = rgb / intensity - normalized color (0-1 range)
+    intensity = max(rgb.r, rgb.g, rgb.b)
+
+    if intensity > 0
+        # Normalize color to 0-1 range
+        norm_r = Float32(rgb.r / intensity)
+        norm_g = Float32(rgb.g / intensity)
+        norm_b = Float32(rgb.b / intensity)
+    else
+        norm_r = 1f0
+        norm_g = 1f0
+        norm_b = 1f0
+        intensity = 0f0
+    end
+
+    # Create RGBIlluminantSpectrum from normalized color
+    table = Hikari.get_srgb_table()
+    spectrum = Hikari.rgb_illuminant_spectrum(table, norm_r, norm_g, norm_b)
+
+    # Scale calculation following pbrt-v4:
+    # Li = scale * spectrum.Sample(lambda) / dist²
+    # spectrum.Sample(lambda) = spectrum.scale * poly(λ) * D65(λ)
+    #   For normalized RGB, poly ≈ 0.5 and scale = 2, so Sample ≈ D65(λ)
+    #
+    # In pbrt-v4, PointLight::Create does:
+    #   light_scale = 1 / SpectrumToPhotometric(illuminant)
+    # where SpectrumToPhotometric extracts just the D65 illuminant from RGBIlluminantSpectrum
+    # and computes InnerProduct(D65, Y) = D65_PHOTOMETRIC
+    #
+    # So: scale = intensity / D65_PHOTOMETRIC
+    scale = Float32(intensity) / Hikari.D65_PHOTOMETRIC
+
+    return Hikari.PointLight(Vec3f(light.position), spectrum, scale)
 end
 
 function to_trace_light(light::Makie.SunSkyLight)
@@ -1075,7 +1247,11 @@ function to_trace_light(light::Makie.EnvironmentLight)
     # Build rotation matrix from axis-angle
     rotation = Hikari.rotation_matrix(light.rotation_angle, light.rotation_axis)
     env_map = Hikari.EnvironmentMap(data, rotation)
-    return Hikari.EnvironmentLight(env_map, Hikari.RGBSpectrum(light.intensity))
+    # Apply photometric normalization to match pbrt-v4:
+    # pbrt-v4 divides scale by SpectrumToPhotometric(&colorSpace->illuminant)
+    # which normalizes radiance to be equivalent to 1 nit
+    photometric_scale = light.intensity / Hikari.D65_PHOTOMETRIC
+    return Hikari.EnvironmentLight(env_map, Hikari.RGBSpectrum(photometric_scale))
 end
 
 function to_trace_light(light)
@@ -1155,134 +1331,151 @@ function convert_scene_with_state(mscene::Makie.Scene, backend::Type=Array, inte
     # Collect Instance objects and materials
     # MeshScatter creates a single Instance with multiple transforms (efficient instancing)
     # Regular meshes create one Instance per mesh
-    instances = Raycore.Instance[]
-    materials_list = Hikari.Material[]
-    plot_to_instance_info = Dict{Makie.AbstractPlot, Tuple{Int, Int, Bool, Int}}()  # plot -> (first_instance_idx, count, per_instance_materials, first_descriptor_idx)
+    #
+    # IMPORTANT: We use a two-pass approach to handle MediumInterface -> MediumInterfaceIdx conversion:
+    # 1. First pass: collect all plot results and their raw materials
+    # 2. Convert all MediumInterface materials to MediumInterfaceIdx (extracts media for VolPath)
+    # 3. Second pass: build instances with MaterialIndex based on CONVERTED materials
+    #
+    # This is necessary because MediumInterface{HomogeneousMedium} and MediumInterface{GridMedium}
+    # are different parametric types, but both convert to the same MediumInterfaceIdx type.
+    # If we assign MaterialIndex before conversion, the type slots won't match after conversion.
 
-    # Helper to get or add material and return (type_slot, index_within_type)
-    # We track materials grouped by type for proper MaterialIndex
-    type_to_slot = Dict{DataType, UInt8}()
-    type_to_materials = Dict{DataType, Vector{Hikari.Material}}()
-    type_order = DataType[]
+    # First pass: collect all plot results
+    plot_results = Tuple{Makie.AbstractPlot, Any}[]
+    raw_materials = Hikari.Material[]  # All unique materials in encounter order
 
-    function get_material_index(mat::Hikari.Material)
-        T = typeof(mat)
-        if !haskey(type_to_slot, T)
-            type_to_slot[T] = UInt8(length(type_to_slot) + 1)
-            type_to_materials[T] = Hikari.Material[]
-            push!(type_order, T)
-        end
-        slot = type_to_slot[T]
-        # Check if this exact material already exists
-        existing_idx = findfirst(==(mat), type_to_materials[T])
-        if !isnothing(existing_idx)
-            return Hikari.MaterialIndex(slot, UInt32(existing_idx))
-        end
-        # Add new material
-        push!(type_to_materials[T], mat)
-        push!(materials_list, mat)
-        return Hikari.MaterialIndex(slot, UInt32(length(type_to_materials[T])))
-    end
-
-    # Track cumulative InstanceDescriptor count (not Instance count)
-    # because one Instance with N transforms creates N InstanceDescriptors
-    total_instance_descriptors = 0
-
-    # Track plot-to-material mapping for registering updates later
-    # Maps plot -> (material, material_index)
-    plot_to_material = Dict{Makie.AbstractPlot, Tuple{Hikari.Material, Hikari.MaterialIndex}}()
-
-    for plot in mscene.plots
-        # Pass integrator to Volume plots for proper material creation
+    for plot in Makie.collect_atomic_plots(mscene)
         result = if plot isa Makie.Volume
             to_trace_primitive_with_transform(plot, integrator)
         else
             to_trace_primitive_with_transform(plot)
         end
         if !isnothing(result)
+            push!(plot_results, (plot, result))
+            # Collect materials from this result
             if result isa MeshScatterResult
-                first_idx = length(instances) + 1
-                first_descriptor_idx = total_instance_descriptors + 1
-                n_instances = length(result.transforms)
-
-                has_per_instance_mats = result.materials isa Vector
-                if has_per_instance_mats
-                    # Per-instance materials: create separate Instance for each
-                    # This creates one BLAS per instance (less efficient but correct)
-                    for (transform, mat) in zip(result.transforms, result.materials)
-                        mat_index = get_material_index(mat)
-                        push!(instances, Raycore.Instance(result.mesh, transform, mat_index))
+                if result.materials isa Vector
+                    for mat in result.materials
+                        mat ∉ raw_materials && push!(raw_materials, mat)
                     end
-                    total_instance_descriptors += n_instances
                 else
-                    # Single material for all instances (efficient instancing)
-                    mat_index = get_material_index(result.materials)
-                    metadata = [mat_index for _ in 1:n_instances]
-                    push!(instances, Raycore.Instance(result.mesh, result.transforms, metadata))
-                    total_instance_descriptors += n_instances
+                    result.materials ∉ raw_materials && push!(raw_materials, result.materials)
                 end
-
-                plot_to_instance_info[plot] = (first_idx, n_instances, has_per_instance_mats, first_descriptor_idx)
-                # Track material for MeshScatter (for compute graph updates)
-                # Use first material for per-instance case, or the single material
-                mat_for_update = has_per_instance_mats ? first(result.materials) : result.materials
-                mat_idx_for_update = get_material_index(mat_for_update)
-                plot_to_material[plot] = (mat_for_update, mat_idx_for_update)
             elseif result isa Vector
-                # Multiple primitives from MetaMesh - each gets its own Instance
-                first_idx = length(instances) + 1
-                first_descriptor_idx = total_instance_descriptors + 1
-                first_mat = nothing
-                first_mat_idx = nothing
-                for (mesh, mat, transform) in result
-                    mat_index = get_material_index(mat)
-                    push!(instances, Raycore.Instance(mesh, transform, mat_index))
-                    if isnothing(first_mat)
-                        first_mat = mat
-                        first_mat_idx = mat_index
-                    end
-                end
-                total_instance_descriptors += length(result)
-                plot_to_instance_info[plot] = (first_idx, length(result), false, first_descriptor_idx)
-                # Track first material for MetaMesh (for compute graph updates)
-                if !isnothing(first_mat)
-                    plot_to_material[plot] = (first_mat, first_mat_idx)
+                for (_, mat, _) in result
+                    mat ∉ raw_materials && push!(raw_materials, mat)
                 end
             else
-                mesh, mat, transform = result
-                first_idx = length(instances) + 1
-                first_descriptor_idx = total_instance_descriptors + 1
+                _, mat, _ = result
+                mat ∉ raw_materials && push!(raw_materials, mat)
+            end
+        end
+    end
+
+    # Convert MediumInterface -> MediumInterfaceIdx and extract media for VolPath
+    converted_materials, media_tuple = Hikari.extract_media_and_convert(raw_materials)
+
+    # Build mapping from original material to converted material
+    raw_to_converted = Dict{Hikari.Material, Hikari.Material}()
+    for (raw, conv) in zip(raw_materials, converted_materials)
+        raw_to_converted[raw] = conv
+    end
+
+    # Build type_to_slot from CONVERTED materials (ensures correct slot assignment)
+    type_to_slot = Dict{DataType, UInt8}()
+    type_to_materials = Dict{DataType, Vector{Hikari.Material}}()
+    type_order = DataType[]
+    materials_list = Hikari.Material[]
+
+    function get_material_index(mat::Hikari.Material)
+        # Convert MediumInterface to MediumInterfaceIdx if needed
+        converted_mat = get(raw_to_converted, mat, mat)
+        T = typeof(converted_mat)
+        if !haskey(type_to_slot, T)
+            type_to_slot[T] = UInt8(length(type_to_slot) + 1)
+            type_to_materials[T] = Hikari.Material[]
+            push!(type_order, T)
+        end
+        slot = type_to_slot[T]
+        # Check if this exact converted material already exists
+        existing_idx = findfirst(==(converted_mat), type_to_materials[T])
+        if !isnothing(existing_idx)
+            return Hikari.MaterialIndex(slot, UInt32(existing_idx))
+        end
+        # Add new material
+        push!(type_to_materials[T], converted_mat)
+        push!(materials_list, converted_mat)
+        return Hikari.MaterialIndex(slot, UInt32(length(type_to_materials[T])))
+    end
+
+    # Second pass: build instances with correct MaterialIndex
+    instances = Raycore.Instance[]
+    plot_to_instance_info = Dict{Makie.AbstractPlot, Tuple{Int, Int, Bool, Int}}()
+    total_instance_descriptors = 0
+    plot_to_material = Dict{Makie.AbstractPlot, Tuple{Hikari.Material, Hikari.MaterialIndex}}()
+
+    for (plot, result) in plot_results
+        if result isa MeshScatterResult
+            first_idx = length(instances) + 1
+            first_descriptor_idx = total_instance_descriptors + 1
+            n_instances = length(result.transforms)
+
+            has_per_instance_mats = result.materials isa Vector
+            if has_per_instance_mats
+                for (transform, mat) in zip(result.transforms, result.materials)
+                    mat_index = get_material_index(mat)
+                    push!(instances, Raycore.Instance(result.mesh, transform, mat_index))
+                end
+                total_instance_descriptors += n_instances
+            else
+                mat_index = get_material_index(result.materials)
+                metadata = [mat_index for _ in 1:n_instances]
+                push!(instances, Raycore.Instance(result.mesh, result.transforms, metadata))
+                total_instance_descriptors += n_instances
+            end
+
+            plot_to_instance_info[plot] = (first_idx, n_instances, has_per_instance_mats, first_descriptor_idx)
+            mat_for_update = has_per_instance_mats ? first(result.materials) : result.materials
+            mat_idx_for_update = get_material_index(mat_for_update)
+            plot_to_material[plot] = (mat_for_update, mat_idx_for_update)
+        elseif result isa Vector
+            first_idx = length(instances) + 1
+            first_descriptor_idx = total_instance_descriptors + 1
+            first_mat = nothing
+            first_mat_idx = nothing
+            for (mesh, mat, transform) in result
                 mat_index = get_material_index(mat)
                 push!(instances, Raycore.Instance(mesh, transform, mat_index))
-                total_instance_descriptors += 1
-                plot_to_instance_info[plot] = (first_idx, 1, false, first_descriptor_idx)
-                # Track material for this plot (for compute graph updates)
-                plot_to_material[plot] = (mat, mat_index)
+                if isnothing(first_mat)
+                    first_mat = mat
+                    first_mat_idx = mat_index
+                end
             end
+            total_instance_descriptors += length(result)
+            plot_to_instance_info[plot] = (first_idx, length(result), false, first_descriptor_idx)
+            if !isnothing(first_mat)
+                plot_to_material[plot] = (first_mat, first_mat_idx)
+            end
+        else
+            mesh, mat, transform = result
+            first_idx = length(instances) + 1
+            first_descriptor_idx = total_instance_descriptors + 1
+            mat_index = get_material_index(mat)
+            push!(instances, Raycore.Instance(mesh, transform, mat_index))
+            total_instance_descriptors += 1
+            plot_to_instance_info[plot] = (first_idx, 1, false, first_descriptor_idx)
+            plot_to_material[plot] = (mat, mat_index)
         end
     end
 
     # Build TLAS from instances
     tlas, handles = Raycore.TLAS(instances)
 
-    # Convert MediumInterface -> MediumInterfaceIdx and extract media for VolPath
-    # This is needed because VolPath requires indexed medium references
-    converted_materials, media_tuple = Hikari.extract_media_and_convert(materials_list)
-
-    # Rebuild type-grouped materials from converted list
-    type_to_slot_converted = Dict{DataType, UInt8}()
-    type_to_materials_converted = Dict{DataType, Vector{Hikari.Material}}()
-    type_order_converted = DataType[]
-
-    for mat in converted_materials
-        T = typeof(mat)
-        if !haskey(type_to_slot_converted, T)
-            type_to_slot_converted[T] = UInt8(length(type_to_slot_converted) + 1)
-            type_to_materials_converted[T] = Hikari.Material[]
-            push!(type_order_converted, T)
-        end
-        push!(type_to_materials_converted[T], mat)
-    end
+    # Type groupings are already built from converted materials above
+    type_to_slot_converted = type_to_slot
+    type_to_materials_converted = type_to_materials
+    type_order_converted = type_order
 
     # Build materials tuple from type-grouped materials
     materials = if isempty(type_order_converted)
@@ -1613,13 +1806,6 @@ function create_material_with_color(color::Colorant, template::Hikari.MatteMater
     Hikari.MatteMaterial(Hikari.ConstantTexture(to_spectrum(color)), template.σ)
 end
 
-function create_material_with_color(color::Colorant, template::Hikari.PlasticMaterial)
-    Hikari.PlasticMaterial(
-        Hikari.ConstantTexture(to_spectrum(color)),
-        template.Ks, template.roughness, template.remap_roughness
-    )
-end
-
 function create_material_with_color(color::Colorant, template::Hikari.MetalMaterial)
     # For metals, color is used as reflectance tint (multiplies Fresnel result)
     # This preserves the physical eta/k values while allowing color variation
@@ -1709,31 +1895,6 @@ function render_frame!(state::TraceMakieState; samples=1, max_depth=5)
     return state.film.framebuffer
 end
 
-function render_whitted(mscene::Makie.Scene; samples=8, max_depth=5)
-    scene, camera, film = convert_scene(mscene)
-    integrator = Hikari.Whitted(samples=samples, max_depth=max_depth)
-    # Call integrator directly - it uses KernelAbstractions for CPU/GPU dispatch
-    integrator(scene, film, camera[])
-    return film.framebuffer
-end
-
-function render_sppm(mscene::Makie.Scene; search_radius=0.075f0, max_depth=5, iterations=100)
-    scene, camera, film = convert_scene(mscene)
-    integrator = Hikari.SPPM(search_radius=search_radius, max_depth=max_depth, iterations=iterations)
-    integrator(scene, film, camera[])
-    return film.framebuffer
-end
-
-function render_gpu(mscene::Makie.Scene, ArrayType; samples=8, max_depth=5)
-    scene, camera, film = convert_scene(mscene)
-    integrator = Hikari.Whitted(samples=samples, max_depth=max_depth)
-    # to_gpu uses Raycore.PRESERVE global to keep GPU arrays alive during kernel execution
-    gpu_scene = Hikari.to_gpu(ArrayType, scene)
-    gpu_film = Hikari.to_gpu(ArrayType, film)
-    integrator(gpu_scene, gpu_film, camera[])
-    # Copy result from GPU film back to CPU
-    return Array(gpu_film.framebuffer)
-end
 
 
 """
@@ -1860,6 +2021,10 @@ end
 
 # Export TraceMakie-specific types
 export Screen, ScreenConfig, Whitted, activate!, colorbuffer
+
+# Re-export DenoiseConfig from Hikari for convenience
+const DenoiseConfig = Hikari.DenoiseConfig
+export DenoiseConfig
 
 # re-export Makie, including deprecated names
 for name in names(Makie, all=true)
