@@ -787,7 +787,7 @@ function extract_material(plot::Plot, tex::Union{Hikari.Texture, Nothing})
         return material
     elseif tex isa Hikari.Texture
         # Only color provided - create MatteMaterial
-        return Hikari.MatteMaterial(tex, Hikari.ConstantTexture(0.0f0))
+        return Hikari.MatteMaterial(tex, Hikari.ConstTexture(0.0f0))
     else
         error("Neither color nor material are defined for plot: $plot")
     end
@@ -823,7 +823,7 @@ function extract_material(plot::Plot, color_obs::Union{Makie.Computed, Observabl
         # Per-instance colors (e.g., for meshscatter)
         tex = Hikari.Texture(to_spectrum.(color))
     elseif color isa Colorant || color isa Union{String,Symbol}
-        tex = Hikari.ConstantTexture(to_spectrum(to_color(color)))
+        tex = Hikari.ConstTexture(to_spectrum(to_color(color)))
     elseif color isa Nothing
         # ignore!
         nothing
@@ -845,7 +845,7 @@ function glb_material_to_hikari(mat_dict::Dict{String, Any})
             img = diffuse_map["image"]
             tex = Hikari.Texture(to_spectrum(img))
             roughness = get(mat_dict, "roughness", 0.5f0)
-            return Hikari.MatteMaterial(tex, Hikari.ConstantTexture(Float32(roughness) * 90f0))
+            return Hikari.MatteMaterial(tex, Hikari.ConstTexture(Float32(roughness) * 90f0))
         end
     end
 
@@ -853,15 +853,15 @@ function glb_material_to_hikari(mat_dict::Dict{String, Any})
     if haskey(mat_dict, "diffuse")
         diffuse = mat_dict["diffuse"]
         color = RGBf(diffuse[1], diffuse[2], diffuse[3])
-        tex = Hikari.ConstantTexture(to_spectrum(color))
+        tex = Hikari.ConstTexture(to_spectrum(color))
         roughness = get(mat_dict, "roughness", 0.5f0)
-        return Hikari.MatteMaterial(tex, Hikari.ConstantTexture(Float32(roughness) * 90f0))
+        return Hikari.MatteMaterial(tex, Hikari.ConstTexture(Float32(roughness) * 90f0))
     end
 
     # Default: white matte
     return Hikari.MatteMaterial(
-        Hikari.ConstantTexture(Hikari.RGBSpectrum(0.8f0, 0.8f0, 0.8f0)),
-        Hikari.ConstantTexture(0.0f0)
+        Hikari.ConstTexture(Hikari.RGBSpectrum(0.8f0, 0.8f0, 0.8f0)),
+        Hikari.ConstTexture(0.0f0)
     )
 end
 
@@ -961,7 +961,7 @@ function extract_surface_material(plot::Makie.Surface)
         tex = Hikari.Texture(to_spectrum(color))
     elseif color isa Colorant || color isa Union{String, Symbol}
         # Single color for entire surface
-        tex = Hikari.ConstantTexture(to_spectrum(to_color(color)))
+        tex = Hikari.ConstTexture(to_spectrum(to_color(color)))
     else
         # Use Makie's compute_colors to get colormapped texture from z values
         computed = Makie.compute_colors(plot.attributes)
@@ -971,7 +971,7 @@ function extract_surface_material(plot::Makie.Surface)
     if material_template isa Hikari.Material
         return merge_color_with_material(tex, material_template)
     else
-        return Hikari.MatteMaterial(tex, Hikari.ConstantTexture(0.0f0))
+        return Hikari.MatteMaterial(tex, Hikari.ConstTexture(0.0f0))
     end
 end
 
@@ -1799,11 +1799,11 @@ Create a material with the given color, optionally based on a template material.
 """
 function create_material_with_color(color::Colorant, template::Nothing)
     # Default to MatteMaterial with the color
-    Hikari.MatteMaterial(Hikari.ConstantTexture(to_spectrum(color)), Hikari.ConstantTexture(0.0f0))
+    Hikari.MatteMaterial(Hikari.ConstTexture(to_spectrum(color)), Hikari.ConstTexture(0.0f0))
 end
 
 function create_material_with_color(color::Colorant, template::Hikari.MatteMaterial)
-    Hikari.MatteMaterial(Hikari.ConstantTexture(to_spectrum(color)), template.σ)
+    Hikari.MatteMaterial(Hikari.ConstTexture(to_spectrum(color)), template.σ)
 end
 
 function create_material_with_color(color::Colorant, template::Hikari.MetalMaterial)
@@ -1811,7 +1811,7 @@ function create_material_with_color(color::Colorant, template::Hikari.MetalMater
     # This preserves the physical eta/k values while allowing color variation
     Hikari.MetalMaterial(
         template.eta, template.k, template.roughness,
-        Hikari.ConstantTexture(to_spectrum(color)),
+        Hikari.ConstTexture(to_spectrum(color)),
         template.remap_roughness
     )
 end
@@ -1819,7 +1819,7 @@ end
 function create_material_with_color(color::Colorant, template::Hikari.Material)
     # Fallback: use MatteMaterial with the color
     @warn "Unsupported material type $(typeof(template)) for per-instance colors, using MatteMaterial"
-    Hikari.MatteMaterial(Hikari.ConstantTexture(to_spectrum(color)), Hikari.ConstantTexture(0.0f0))
+    Hikari.MatteMaterial(Hikari.ConstTexture(to_spectrum(color)), Hikari.ConstTexture(0.0f0))
 end
 
 # Keep the old convert_scene for backwards compatibility

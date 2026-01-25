@@ -62,7 +62,7 @@ TraceMakie.activate!(backend=ROCArray,
     gamma=2.2f0,
     sensor=Hikari.FilmSensor(iso=50, exposure_time=1.0, white_balance=0)
 )
-integrator = Hikari.VolPath(samples=100, max_depth=30, max)
+integrator = Hikari.VolPath(samples=100, max_depth=30)
 img = @time colorbuffer(ax; backend=TraceMakie, integrator=integrator, max_component_value=10000f0)
 # save(joinpath(@__DIR__, "caustic_glass.png"), img)
 img

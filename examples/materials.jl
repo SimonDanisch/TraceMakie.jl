@@ -212,7 +212,7 @@ end
 # Render
 TraceMakie.activate!(backend=Array,
     exposure=0.6f0,
-    tonemap=:aces,
+    tonemap=:aces,s
     gamma=2.2f0,
     sensor=Hikari.FilmSensor(iso=50, exposure_time=1.0, white_balance=0)
 )
@@ -220,4 +220,7 @@ nsamples = 10
 integrator = Hikari.VolPath(samples=nsamples, max_depth=50)
 img = @time colorbuffer(ax; backend=TraceMakie, integrator=integrator)
 save(joinpath(@__DIR__, "materials-julia-$(nsamples)spp.png"), img)
+# Array: 23s
+# ROCarray:1.4s
+
 img
