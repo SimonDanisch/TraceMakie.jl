@@ -641,7 +641,7 @@ function render_rayshader_interactive(;
     # scene.viewport[] = Makie.Rect2f(0, 0, figsize...)
 
     # Create integrator for progressive rendering (1 sample per iteration)
-    integrator = TraceMakie.VolPath(samples_per_pixel=1, max_depth=max_depth)
+    integrator = TraceMakie.VolPath(samples=1, max_depth=max_depth)
 
     # Create sensor with D65 daylight white balance
     sensor = Hikari.FilmSensor(iso=100, white_balance=6500)
@@ -664,7 +664,7 @@ function render_rayshader_interactive(;
 
     return handles, scene
 end
-
+using AMDGPU
 # Uncomment to test interactive rendering:
 handles, scene = render_rayshader_interactive(
     lat=47.087441,
@@ -675,7 +675,7 @@ handles, scene = render_rayshader_interactive(
     sun_altitude=20.0,
     sun_azimuth=135.0,
     max_depth=12,
-    backend=CLArray,
+    backend=ROCArray,
     exposure=0.8f0,
     figsize=(1024, 768),
 )

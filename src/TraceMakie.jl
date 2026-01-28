@@ -80,7 +80,7 @@ For MeshScatter plots, `instance_count` tracks the number of instances sharing o
 """
 mutable struct PlotInfo
     plot::Makie.AbstractPlot
-    handle::Raycore.InstanceHandle
+    handle::Raycore.TLASHandle
     transform_obs::Union{Observable, Nothing}
     obs_funcs::Vector{Observables.ObserverFunction}
     instance_count::Int  # Number of instances (>1 for MeshScatter)
@@ -114,14 +114,14 @@ mutable struct TraceMakieState
     film::Hikari.Film  # Can be CPU (Array) or GPU (ROCArray/CuArray) - types differentiate
     camera::Observable
     needs_refit::Bool  # Flag to track if TLAS needs refit
-    hikari_scene::Hikari.AbstractScene  # Contains the TLAS via hikari_scene.aggregate.accel (Scene for CPU, ImmutableScene for GPU)
+    hikari_scene::Hikari.AbstractScene  # Contains the TLAS via hikari_scene.accel (Scene for CPU, ImmutableScene for GPU)
     preserve::Vector{Any}  # Keep GPU arrays alive (empty for CPU)
     update_infos::Vector{PlotUpdateInfo}  # Track plots for compute graph polling
     needs_film_clear::Bool  # Flag to indicate data changed and film should be cleared
 end
 
-# Helper to get TLAS from state (it's inside hikari_scene.aggregate.accel)
-get_tlas(state::TraceMakieState) = state.hikari_scene.aggregate.accel
+# Helper to get TLAS from state (it's inside hikari_scene.accel)
+get_tlas(state::TraceMakieState) = state.hikari_scene.accel
 
 """
     register_plot_updates!(state::TraceMakieState, info::PlotInfo, material, material_idx)
@@ -637,9 +637,9 @@ TraceMakie.activate!(exposure = 1.5, tonemap = :reinhard, gamma = 2.2)
 ```
 """
 function activate!(; screen_config...)
-    # Register TraceMakie's default theme if not already registered
-    key = :TraceMakie
-    Makie.set_screen_config!(TraceMakie, screen_config)
+    if !isempty(screen_config)
+        Makie.set_screen_config!(TraceMakie, screen_config)
+    end
     Makie.set_active_backend!(TraceMakie)
     return
 end
@@ -689,9 +689,7 @@ Refit the TLAS if any transforms have changed.
 """
 function refit_if_needed!(state::TraceMakieState)
     if state.needs_refit
-        # Get backend from film for GPU support (same code path for CPU and GPU via KernelAbstractions)
-        backend = KernelAbstractions.get_backend(state.film.framebuffer)
-        Raycore.refit_tlas!(get_tlas(state); backend=backend)
+        Raycore.refit_tlas!(get_tlas(state))
         state.needs_refit = false
     end
 end
@@ -1328,22 +1326,42 @@ function convert_scene_with_state(mscene::Makie.Scene, backend::Type=Array, inte
         diagonal=1.0f0, scale=1.0f0,
     )
 
-    # Collect Instance objects and materials
-    # MeshScatter creates a single Instance with multiple transforms (efficient instancing)
-    # Regular meshes create one Instance per mesh
-    #
-    # IMPORTANT: We use a two-pass approach to handle MediumInterface -> MediumInterfaceIdx conversion:
-    # 1. First pass: collect all plot results and their raw materials
-    # 2. Convert all MediumInterface materials to MediumInterfaceIdx (extracts media for VolPath)
-    # 3. Second pass: build instances with MaterialIndex based on CONVERTED materials
-    #
-    # This is necessary because MediumInterface{HomogeneousMedium} and MediumInterface{GridMedium}
-    # are different parametric types, but both convert to the same MediumInterfaceIdx type.
-    # If we assign MaterialIndex before conversion, the type slots won't match after conversion.
+    # Create empty Hikari scene with incremental API
+    # Uses MultiTypeVec for materials/media which handles MediumInterface conversion
+    # Determine KA backend from array type
+    ka_backend = if backend === Array
+        Raycore.KA.CPU()
+    else
+        # Create temp array to infer KA backend from array type
+        tmp = backend{Float32}(undef, 1)
+        Raycore.KA.get_backend(tmp)
+    end
+    hikari_scene = Hikari.Scene(backend=ka_backend)
 
-    # First pass: collect all plot results
-    plot_results = Tuple{Makie.AbstractPlot, Any}[]
-    raw_materials = Hikari.Material[]  # All unique materials in encounter order
+    # Track media for MediumInterface -> MediumInterfaceIdx conversion
+    medium_to_index = Dict{Any, Raycore.HeteroVecIndex}()
+
+    # Helper to convert material (handles MediumInterface) and push to scene
+    function push_material!(mat::Hikari.Material)
+        # For MediumInterface, first push media to get indices, then convert
+        if mat isa Hikari.MediumInterface
+            for medium in (mat.inside, mat.outside)
+                if medium !== nothing && !haskey(medium_to_index, medium)
+                    idx = push!(hikari_scene.media, medium)
+                    medium_to_index[medium] = idx
+                end
+            end
+            converted_mat = Hikari.to_indexed(mat, medium_to_index)
+            return push!(hikari_scene.materials, converted_mat)
+        else
+            return push!(hikari_scene.materials, mat)
+        end
+    end
+
+    # Collect plot results and build scene
+    plot_infos = PlotInfo[]
+    plot_to_material = Dict{Makie.AbstractPlot, Tuple{Hikari.Material, Hikari.MaterialIndex}}()
+    handle_idx = 0
 
     for plot in Makie.collect_atomic_plots(mscene)
         result = if plot isa Makie.Volume
@@ -1351,184 +1369,114 @@ function convert_scene_with_state(mscene::Makie.Scene, backend::Type=Array, inte
         else
             to_trace_primitive_with_transform(plot)
         end
-        if !isnothing(result)
-            push!(plot_results, (plot, result))
-            # Collect materials from this result
-            if result isa MeshScatterResult
-                if result.materials isa Vector
-                    for mat in result.materials
-                        mat ∉ raw_materials && push!(raw_materials, mat)
-                    end
-                else
-                    result.materials ∉ raw_materials && push!(raw_materials, result.materials)
-                end
-            elseif result isa Vector
-                for (_, mat, _) in result
-                    mat ∉ raw_materials && push!(raw_materials, mat)
-                end
-            else
-                _, mat, _ = result
-                mat ∉ raw_materials && push!(raw_materials, mat)
-            end
+
+        if isnothing(result)
+            continue
         end
-    end
 
-    # Convert MediumInterface -> MediumInterfaceIdx and extract media for VolPath
-    converted_materials, media_tuple = Hikari.extract_media_and_convert(raw_materials)
-
-    # Build mapping from original material to converted material
-    raw_to_converted = Dict{Hikari.Material, Hikari.Material}()
-    for (raw, conv) in zip(raw_materials, converted_materials)
-        raw_to_converted[raw] = conv
-    end
-
-    # Build type_to_slot from CONVERTED materials (ensures correct slot assignment)
-    type_to_slot = Dict{DataType, UInt8}()
-    type_to_materials = Dict{DataType, Vector{Hikari.Material}}()
-    type_order = DataType[]
-    materials_list = Hikari.Material[]
-
-    function get_material_index(mat::Hikari.Material)
-        # Convert MediumInterface to MediumInterfaceIdx if needed
-        converted_mat = get(raw_to_converted, mat, mat)
-        T = typeof(converted_mat)
-        if !haskey(type_to_slot, T)
-            type_to_slot[T] = UInt8(length(type_to_slot) + 1)
-            type_to_materials[T] = Hikari.Material[]
-            push!(type_order, T)
-        end
-        slot = type_to_slot[T]
-        # Check if this exact converted material already exists
-        existing_idx = findfirst(==(converted_mat), type_to_materials[T])
-        if !isnothing(existing_idx)
-            return Hikari.MaterialIndex(slot, UInt32(existing_idx))
-        end
-        # Add new material
-        push!(type_to_materials[T], converted_mat)
-        push!(materials_list, converted_mat)
-        return Hikari.MaterialIndex(slot, UInt32(length(type_to_materials[T])))
-    end
-
-    # Second pass: build instances with correct MaterialIndex
-    instances = Raycore.Instance[]
-    plot_to_instance_info = Dict{Makie.AbstractPlot, Tuple{Int, Int, Bool, Int}}()
-    total_instance_descriptors = 0
-    plot_to_material = Dict{Makie.AbstractPlot, Tuple{Hikari.Material, Hikari.MaterialIndex}}()
-
-    for (plot, result) in plot_results
         if result isa MeshScatterResult
-            first_idx = length(instances) + 1
-            first_descriptor_idx = total_instance_descriptors + 1
             n_instances = length(result.transforms)
-
             has_per_instance_mats = result.materials isa Vector
+
             if has_per_instance_mats
+                # Each instance has its own material
+                first_handle = nothing
+                first_descriptor_idx = length(hikari_scene.accel.instances) + 1
                 for (transform, mat) in zip(result.transforms, result.materials)
-                    mat_index = get_material_index(mat)
-                    push!(instances, Raycore.Instance(result.mesh, transform, mat_index))
+                    mat_idx = push_material!(mat)
+                    handle = push!(hikari_scene.accel, result.mesh, mat_idx, transform)
+                    if isnothing(first_handle)
+                        first_handle = handle
+                    end
                 end
-                total_instance_descriptors += n_instances
+                handle_idx += n_instances
+                info = PlotInfo(plot, first_handle, Makie.transformationmatrix(plot),
+                               Observables.ObserverFunction[], n_instances, true, first_descriptor_idx)
+                push!(plot_infos, info)
+                plot_to_material[plot] = (first(result.materials), push_material!(first(result.materials)))
             else
-                mat_index = get_material_index(result.materials)
-                metadata = [mat_index for _ in 1:n_instances]
-                push!(instances, Raycore.Instance(result.mesh, result.transforms, metadata))
-                total_instance_descriptors += n_instances
+                # All instances share one material - use batched instancing
+                mat_idx = push_material!(result.materials)
+                first_descriptor_idx = length(hikari_scene.accel.instances) + 1
+                # Push mesh with multiple transforms
+                handle = push!(hikari_scene.accel, Raycore.Instance(result.mesh, result.transforms,
+                              [mat_idx for _ in 1:n_instances]))
+                handle_idx += 1
+                info = PlotInfo(plot, handle, Makie.transformationmatrix(plot),
+                               Observables.ObserverFunction[], n_instances, false, first_descriptor_idx)
+                push!(plot_infos, info)
+                plot_to_material[plot] = (result.materials, mat_idx)
             end
 
-            plot_to_instance_info[plot] = (first_idx, n_instances, has_per_instance_mats, first_descriptor_idx)
-            mat_for_update = has_per_instance_mats ? first(result.materials) : result.materials
-            mat_idx_for_update = get_material_index(mat_for_update)
-            plot_to_material[plot] = (mat_for_update, mat_idx_for_update)
         elseif result isa Vector
-            first_idx = length(instances) + 1
-            first_descriptor_idx = total_instance_descriptors + 1
+            # Multiple meshes from one plot
+            first_handle = nothing
             first_mat = nothing
             first_mat_idx = nothing
+            first_descriptor_idx = length(hikari_scene.accel.instances) + 1
             for (mesh, mat, transform) in result
-                mat_index = get_material_index(mat)
-                push!(instances, Raycore.Instance(mesh, transform, mat_index))
-                if isnothing(first_mat)
+                mat_idx = push_material!(mat)
+                handle = push!(hikari_scene.accel, mesh, mat_idx, transform)
+                if isnothing(first_handle)
+                    first_handle = handle
                     first_mat = mat
-                    first_mat_idx = mat_index
+                    first_mat_idx = mat_idx
                 end
             end
-            total_instance_descriptors += length(result)
-            plot_to_instance_info[plot] = (first_idx, length(result), false, first_descriptor_idx)
+            handle_idx += length(result)
+            info = PlotInfo(plot, first_handle, Makie.transformationmatrix(plot),
+                           Observables.ObserverFunction[], length(result), false, first_descriptor_idx)
+            push!(plot_infos, info)
             if !isnothing(first_mat)
                 plot_to_material[plot] = (first_mat, first_mat_idx)
             end
+
         else
+            # Single mesh
             mesh, mat, transform = result
-            first_idx = length(instances) + 1
-            first_descriptor_idx = total_instance_descriptors + 1
-            mat_index = get_material_index(mat)
-            push!(instances, Raycore.Instance(mesh, transform, mat_index))
-            total_instance_descriptors += 1
-            plot_to_instance_info[plot] = (first_idx, 1, false, first_descriptor_idx)
-            plot_to_material[plot] = (mat, mat_index)
+            first_descriptor_idx = length(hikari_scene.accel.instances) + 1
+            mat_idx = push_material!(mat)
+            handle = push!(hikari_scene.accel, mesh, mat_idx, transform)
+            handle_idx += 1
+            info = PlotInfo(plot, handle, Makie.transformationmatrix(plot),
+                           Observables.ObserverFunction[], 1, false, first_descriptor_idx)
+            push!(plot_infos, info)
+            plot_to_material[plot] = (mat, mat_idx)
         end
     end
 
-    # Build TLAS from instances
-    tlas, handles = Raycore.TLAS(instances)
-
-    # Type groupings are already built from converted materials above
-    type_to_slot_converted = type_to_slot
-    type_to_materials_converted = type_to_materials
-    type_order_converted = type_order
-
-    # Build materials tuple from type-grouped materials
-    materials = if isempty(type_order_converted)
-        (Hikari.MatteMaterial[],)
-    else
-        Tuple([Vector{T}(type_to_materials_converted[T]) for T in type_order_converted])
-    end
-
-    # Create PlotInfos
-    plot_infos = PlotInfo[]
-    for (plot, (first_idx, count, per_instance_mats, first_descriptor_idx)) in plot_to_instance_info
-        handle = handles[first_idx]
-        transform_obs = Makie.transformationmatrix(plot)
-        obs_funcs = Observables.ObserverFunction[]
-        # For per-instance materials, we track the starting InstanceDescriptor index
-        # because each instance has a different blas_index
-        info = PlotInfo(plot, handle, transform_obs, obs_funcs, count, per_instance_mats, first_descriptor_idx)
-        push!(plot_infos, info)
-    end
+    # Build TLAS BVH structure
+    Raycore.sync!(hikari_scene.accel)
 
     camera = to_trace_camera(mscene, film)
 
-    # Extract lights
-    lights = Hikari.Light[]
+    # Extract lights and push to scene
     makie_lights = Makie.get_lights(mscene)
     for light in makie_lights
         l = to_trace_light(light)
-        isnothing(l) || push!(lights, l)
-    end
-
-    # Add ambient light if present, but skip if we already have SunSkyLight
-    # (SunSkyLight provides its own ambient illumination from the sky)
-    has_sunsky = any(l -> l isa Hikari.SunSkyLight, lights)
-    if !has_sunsky && haskey(mscene.compute, :ambient_color)
-        ambient_color = mscene.compute[:ambient_color][]
-        if ambient_color != RGBf(0, 0, 0)
-            push!(lights, Hikari.AmbientLight(to_spectrum(ambient_color)))
+        if !isnothing(l)
+            push!(hikari_scene.lights, l)
         end
     end
 
-    if isempty(lights)
+    # Add ambient light if present, but skip if we already have SunSkyLight
+    has_sunsky = Hikari.SunSkyLight in hikari_scene.lights.data_order
+    if !has_sunsky && haskey(mscene.compute, :ambient_color)
+        ambient_color = mscene.compute[:ambient_color][]
+        if ambient_color != RGBf(0, 0, 0)
+            push!(hikari_scene.lights, Hikari.AmbientLight(to_spectrum(ambient_color)))
+        end
+    end
+
+    if isempty(hikari_scene.lights)
         error("Must have at least one light")
     end
 
-    # Create hikari scene with media tuple for VolPath volumetric rendering
-    material_scene = Hikari.MaterialScene(tlas, materials, media_tuple)
-    hikari_scene = Hikari.Scene(lights, material_scene)
-
-    # Convert to GPU if backend is not Array
+    # Convert film to GPU if backend is not Array
+    # (scene is already created with correct backend above)
     preserve = Any[]
     if backend !== Array
-        hikari_scene = Hikari.to_gpu(backend, hikari_scene)
-        film = Hikari.to_gpu(backend, film)
+        film = Raycore.Adapt.adapt(ka_backend, film)
     end
 
     state = TraceMakieState(plot_infos, film, camera, false, hikari_scene, preserve, PlotUpdateInfo[], false)
@@ -1542,7 +1490,6 @@ function convert_scene_with_state(mscene::Makie.Scene, backend::Type=Array, inte
     end
 
     # Register compute graph updates for each plot
-    # Build a lookup from plot to PlotInfo
     plot_to_info = Dict{Makie.AbstractPlot, PlotInfo}(info.plot => info for info in plot_infos)
     for (plot, (mat, mat_idx)) in plot_to_material
         if haskey(plot_to_info, plot)
@@ -1853,7 +1800,7 @@ function sync_transforms!(state::TraceMakieState)
             Raycore.update_instance_transforms!(tlas, transforms, 1, info.first_instance_idx)
         end
     end
-    Raycore.refit_tlas!(tlas; backend=backend)
+    Raycore.refit_tlas!(tlas)
     state.needs_refit = false
 end
 
