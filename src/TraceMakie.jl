@@ -1327,7 +1327,7 @@ function convert_scene_with_state(mscene::Makie.Scene, backend::Type=Array, inte
     )
 
     # Create empty Hikari scene with incremental API
-    # Uses MultiTypeVec for materials/media which handles MediumInterface conversion
+    # Uses MultiTypeSet for materials/media which handles MediumInterface conversion
     # Determine KA backend from array type
     ka_backend = if backend === Array
         Raycore.KA.CPU()
@@ -1339,7 +1339,7 @@ function convert_scene_with_state(mscene::Makie.Scene, backend::Type=Array, inte
     hikari_scene = Hikari.Scene(backend=ka_backend)
 
     # Track media for MediumInterface -> MediumInterfaceIdx conversion
-    medium_to_index = Dict{Any, Raycore.HeteroVecIndex}()
+    medium_to_index = Dict{Any, Raycore.SetKey}()
 
     # Helper to convert material (handles MediumInterface) and push to scene
     function push_material!(mat::Hikari.Material)
