@@ -136,7 +136,7 @@ function render_nanovdb_bunny(nvdb_path::String;
 end
 nvdb_path = joinpath(@__DIR__, "..", "..", "..", "pbrt-v4-scenes", "bunny-cloud", "bunny_cloud.nvdb")
 using AMDGPU
-nsamples = 40
+nsamples = 5
 @time img, scene = render_nanovdb_bunny(
     nvdb_path;
     samples_per_pixel=nsamples,
@@ -146,7 +146,7 @@ nsamples = 40
     exposure=0.5,
     tonemap=nothing,
     white_balance=5000,
-    backend=ROCArray
+    backend=Array
 )
 img
 # img

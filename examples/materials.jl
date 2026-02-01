@@ -210,7 +210,7 @@ begin
 end
 
 # Render
-TraceMakie.activate!(backend=Array,
+TraceMakie.activate!(backend=ROCArray,
     exposure=0.6f0,
     tonemap=:aces,
     gamma=2.2f0,
